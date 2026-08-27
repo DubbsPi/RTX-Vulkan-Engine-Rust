@@ -28,17 +28,11 @@ use winit::event_loop::EventLoop;
 
 use cgmath::{vec3, point3, Deg};
 use cgmath::SquareMatrix;
+use cgmath::InnerSpace;
 
 
 type Vec3 = cgmath::Vector3<f32>;
 type Mat4 = cgmath::Matrix4<f32>;
-
-
-static VERTICES: [Vertex; 3] = [
-    Vertex::new(vec3(-0.5, -0.5, 0.0), vec3(1.0, 0.0, 0.0)),
-    Vertex::new(vec3(0.5, -0.5, 0.0), vec3(0.0, 1.0, 0.0)),
-    Vertex::new(vec3(0.5, 0.5, 0.0), vec3(0.0, 0.0, 1.0)),
-];
 
 
 const PORTABILITY_MACOS_VERSION: Version = Version::new(1, 3, 216);
@@ -133,9 +127,15 @@ struct App {
     instance: Instance,
     data: AppData,
     device: Device,
+
     frame: usize,
     resized: bool,
-    start: Instant,
+    last_frame: Instant,
+    frame_time: f64,
+
+    camera: Camera,
+    input: InputState,
+    controls_enabled: bool,
 }
 
 impl App {
@@ -151,6 +151,15 @@ impl App {
 
         let device = create_logical_device(&_entry, &instance, &mut data)?;
 
+        let query_pool_info = vk::QueryPoolCreateInfo::builder()
+            .query_type(vk::QueryType::TIMESTAMP)
+            .query_count(2 * MAX_FRAMES_IN_FLIGHT as u32);
+
+        data.timestamp_query_pool = device.create_query_pool(&query_pool_info, None)?;
+
+        let properties = instance.get_physical_device_properties(data.physical_device);
+        data.timestamp_period = properties.limits.timestamp_period;
+
         create_swapchain(window, &instance, &device, &mut data)?;
 
         create_command_pool(&instance, &device, &mut data)?;
@@ -159,8 +168,16 @@ impl App {
         create_descriptor_set_layout(&device, &mut data)?; 
         create_rt_pipeline(&device, &mut data)?;
 
-        create_blas(&instance, &device, &mut data)?;
+        let (vertices, indices, prim_material_ids, materials) = load_obj(
+            "models/FLOWER SET_18.obj", 0.05
+        )?;
+
+        info!("Triangles: {}, Vertices: {}", indices.len() / 3, vertices.len());
+
+        create_blas(&instance, &device, &mut data, &vertices, &indices)?;
         create_tlas(&instance, &device, &mut data)?;
+
+        create_scene_buffers(&instance, &device, &mut data, &materials, &prim_material_ids)?;
 
         create_uniform_buffers(&instance, &device, &mut data)?;
         create_descriptor_pool(&device, &mut data)?;
@@ -174,9 +191,19 @@ impl App {
         
         let frame = 0;
         let resized = false;
-        let start = Instant::now();
+        let last_frame = Instant::now();
+        let frame_time = 0.0;
 
-        Ok(Self {_entry, instance: instance, data, device, frame, resized, start})
+        let camera = Camera::new();
+        let input = InputState::default();
+        let controls_enabled = true;
+
+        Ok(Self {
+            _entry, instance: instance, data, device,
+            frame, resized,
+            last_frame, frame_time,
+            camera, input, controls_enabled
+        })
     }}
 
     unsafe fn destroy(&mut self) { unsafe {
@@ -202,6 +229,16 @@ impl App {
         self.device.destroy_buffer(self.data.vertex_buffer, None);
         self.device.free_memory(self.data.vertex_buffer_memory, None);
 
+        // Material buffers
+        self.device.destroy_buffer(self.data.materials_buffer, None);
+        self.device.free_memory(self.data.materials_buffer_memory, None);
+        self.device.destroy_buffer(self.data.object_descs_buffer, None);
+        self.device.free_memory(self.data.object_descs_buffer_memory, None);
+
+        self.device.destroy_buffer(self.data.material_ids_buffer, None);
+        self.device.free_memory(self.data.material_ids_buffer_memory, None);
+
+        
         self.device.destroy_descriptor_set_layout(self.data.descriptor_set_layout, None);
 
         self.data.in_flight_fences
@@ -213,6 +250,7 @@ impl App {
         self.data.image_available_semaphores
             .iter()
             .for_each(|s| self.device.destroy_semaphore(*s, None));
+        
         self.device.destroy_command_pool(self.data.command_pool, None);
         self.device.destroy_device(None);
         self.instance.destroy_surface_khr(self.data.surface, None);
@@ -258,7 +296,30 @@ impl App {
             true,
             u64::MAX,
         )?;
-        
+
+
+        if self.frame_time != 0.0 || self.frame >= MAX_FRAMES_IN_FLIGHT {
+            let mut timestamps = [0u64; 2];
+            let query_result = self.device.get_query_pool_results(
+                self.data.timestamp_query_pool,
+                (self.frame as u32) * 2,
+                2,
+                std::slice::from_raw_parts_mut(
+                    timestamps.as_mut_ptr().cast::<u8>(),
+                    std::mem::size_of::<u64>() * 2,
+                ),
+                std::mem::size_of::<u64>() as u64,
+                vk::QueryResultFlags::_64,
+            );
+            
+            if query_result.is_ok() {
+                let ticks = timestamps[1].saturating_sub(timestamps[0]);
+                let gpu_ms = (ticks as f64 * self.data.timestamp_period as f64) / 1_000_000.0;
+                self.frame_time = gpu_ms;
+            }
+        }
+
+
         let image_index = match self
             .device
             .acquire_next_image_khr(
@@ -286,6 +347,12 @@ impl App {
         self.data.images_in_flight[image_index as usize] =
             self.data.in_flight_fences[self.frame];
 
+
+        let now = Instant::now();
+        let dt = (now - self.last_frame).as_secs_f32();
+        self.last_frame = now;
+
+        self.update_camera(dt);
         self.update_uniform_buffer(image_index)?;
 
         
@@ -339,6 +406,8 @@ impl App {
             return Ok(());
         }
 
+        info!("Recreating swapchain...");
+
         self.device.device_wait_idle()?;
         self.destroy_swapchain();
 
@@ -348,7 +417,7 @@ impl App {
         create_rt_pipeline(&self.device, &mut self.data)?;
 
         create_shader_binding_table(&self.instance, &self.device, &mut self.data)?;
-
+        
         create_uniform_buffers(&self.instance, &self.device, &mut self.data)?;
         create_descriptor_pool(&self.device, &mut self.data)?;
         create_descriptor_sets(&self.device, &mut self.data)?;
@@ -361,17 +430,7 @@ impl App {
     }}
 
     unsafe fn update_uniform_buffer(&self, image_index: usize) -> Result<()> { unsafe {
-        let time = self.start.elapsed().as_secs_f32();
-
-        let camera_pos = point3(0.0, 0.0, -2.5);
-        let mut camera_dir = [time.sin(), 0.0, 3.0];
-        normalize(&mut camera_dir);
-        
-        let view = Mat4::look_at_rh(
-            camera_pos, 
-            point3(camera_pos[0] + camera_dir[0], camera_pos[1] + camera_dir[1], camera_pos[2] + camera_dir[2]),
-            vec3(0.0, 1.0, 0.0),
-        );
+        let view = self.camera.view_matrix();
 
         let mut proj = cgmath::perspective(
             Deg(45.0),
@@ -381,6 +440,7 @@ impl App {
         );
 
         proj[1][1] *= -1.0; // Invert Y for Vulkan coordinate space
+        proj[0][0] *= -1.0; // Invert X for me
 
         let view_inverse = view.invert().ok_or_else(|| anyhow!("Failed to invert view matrix"))?;
         let proj_inverse = proj.invert().ok_or_else(|| anyhow!("Failed to invert proj matrix"))?;
@@ -405,6 +465,33 @@ impl App {
         
         Ok(())
     }}
+
+    fn update_camera(&mut self, dt: f32) {
+        if self.controls_enabled {
+            self.camera.yaw -= self.input.mouse_dx * self.camera.sensitivity;
+            self.camera.pitch -= self.input.mouse_dy * self.camera.sensitivity;
+            self.camera.pitch = self.camera.pitch.clamp(-1.55, 1.55);
+
+            self.input.mouse_dx = 0.0;
+            self.input.mouse_dy = 0.0;
+
+            let forward = self.camera.forward();
+            let right = self.camera.right();
+            let mut delta = vec3(0.0, 0.0, 0.0);
+
+            if self.input.forward { delta += forward; }
+            if self.input.back    { delta -= forward; }
+            if self.input.right   { delta -= right; }
+            if self.input.left    { delta += right; }
+            if self.input.up      { delta.y += 1.0; }
+            if self.input.down    { delta.y -= 1.0; }
+
+            if delta.magnitude() > 0.0001 {
+                delta = delta.normalize() * self.camera.speed * dt;
+                self.camera.position += delta;
+            }
+        }
+    }
 }
 
 
@@ -434,6 +521,14 @@ struct AppData {
     vertex_buffer_memory: vk::DeviceMemory,
     index_buffer: vk::Buffer,
     index_buffer_memory: vk::DeviceMemory,
+
+    // Materials
+    materials_buffer: vk::Buffer,
+    materials_buffer_memory: vk::DeviceMemory,
+    object_descs_buffer: vk::Buffer,
+    object_descs_buffer_memory: vk::DeviceMemory,
+    material_ids_buffer: vk::Buffer,
+    material_ids_buffer_memory: vk::DeviceMemory,
 
     // Blas
     blas: vk::AccelerationStructureKHR,
@@ -474,6 +569,10 @@ struct AppData {
     render_finished_semaphores: Vec<vk::Semaphore>,
     in_flight_fences: Vec<vk::Fence>,
     images_in_flight: Vec<vk::Fence>,
+
+    // Frametime polling
+    timestamp_query_pool: vk::QueryPool,
+    timestamp_period: f32,
 }
 
 
@@ -486,13 +585,82 @@ pub struct SuitabilityError(pub &'static str);
 #[derive(Copy, Clone, Debug)]
 struct Vertex {
     pos: Vec3,
-    color: Vec3,
 }
 
 impl Vertex {
-    const fn new(pos: Vec3, color: Vec3) -> Self {
-        Self {pos, color}
+    const fn new(pos: Vec3) -> Self {
+        Self {pos}
     }
+}
+
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+struct Material {
+    albedo: Vec3,
+    _pad0: f32,
+    metallic: f32,
+    roughness: f32,
+    _pad1: [f32; 2],
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+struct ObjectDesc {
+    vertex_address: u64,
+    index_address: u64,
+    material_id: u32,
+    _pad: u32,
+}
+
+
+struct Camera {
+    position: cgmath::Point3<f32>,
+    yaw: f32,
+    pitch: f32,
+    speed: f32,
+    sensitivity: f32,
+}
+
+impl Camera {
+    fn new() -> Self {
+        Self {
+            position: point3(0.0, 0.0, -2.5),
+            yaw: 90.0_f32.to_radians(),
+            pitch: 0.0,
+            speed: 2.5,
+            sensitivity: 0.0025,
+        }
+    }
+
+    fn forward(&self) -> Vec3 {
+        vec3(
+            self.yaw.cos() * self.pitch.cos(),
+            self.pitch.sin(),
+            self.yaw.sin() * self.pitch.cos(),
+        )
+    }
+
+    fn right(&self) -> Vec3 {
+        self.forward().cross(vec3(0.0, 1.0, 0.0)).normalize()
+    }
+
+    fn view_matrix(&self) -> Mat4 {
+        Mat4::look_at_rh(self.position, self.position + self.forward(), vec3(0.0, 1.0, 0.0))
+    }
+}
+
+
+#[derive(Default)]
+struct InputState {
+    forward: bool,
+    back: bool,
+    left: bool,
+    right: bool,
+    up: bool,
+    down: bool,
+    mouse_dx: f32,
+    mouse_dy: f32,
 }
 
 
@@ -502,6 +670,7 @@ struct CameraUniformBufferObject {
     view_inverse: Mat4,
     proj_inverse: Mat4,
 }
+
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
@@ -513,13 +682,66 @@ struct RtAccelerationStructureInstance {
 }
 
 
-fn normalize(v: &mut [f32; 3]) {
-    let length = (v[0].powi(2) + v[1].powi(2) + v[2].powi(2)).sqrt();
-    if length != 0.0 {
-        v[0] /= length;
-        v[1] /= length;
-        v[2] /= length;
+// Utility functions
+fn pack_custom_index_and_mask(custom_index: u32, mask: u8) -> u32 {
+    (custom_index & 0x00FF_FFFF) | ((mask as u32) << 24)
+}
+
+fn pack_sbt_offset_and_flags(sbt_offset: u32, flags: vk::GeometryInstanceFlagsKHR) -> u32 {
+    (sbt_offset & 0x00FF_FFFF) | ((flags.bits() as u32) << 24)
+}
+
+fn load_obj(path: &str, scale: f32) -> Result<(Vec<Vertex>, Vec<u32>, Vec<u32>, Vec<Material>)> {
+    let (models, materials) = tobj::load_obj(
+        path,
+        &tobj::LoadOptions {
+            triangulate: true,
+            single_index: true,
+            ..Default::default()
+        },
+    )?;
+
+    let converted_materials = convert_materials(&materials.unwrap_or_default());
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+    let mut material_ids = Vec::new();
+
+    for model in &models {
+        let mesh = &model.mesh;
+        let vertex_offset = vertices.len() as u32;
+
+        let triangle_count = mesh.indices.len() / 3;
+        
+        let mat_id = mesh.material_id.unwrap_or(0) as u32;
+
+        material_ids.extend(std::iter::repeat(mat_id).take(triangle_count));
+
+        vertices.extend(
+            mesh.positions
+                .chunks(3)
+                .map(|p| Vertex::new(vec3(p[0] * scale, p[1] * scale, p[2] * scale))),
+        );
+
+        indices.extend(mesh.indices.iter().map(|i| i + vertex_offset));
     }
+
+    Ok((vertices, indices, material_ids, converted_materials))
+}
+
+fn convert_materials(tobj_materials: &[tobj::Material]) -> Vec<Material> {
+    tobj_materials
+        .iter()
+        .map(|m| {
+            let albedo = m.diffuse.unwrap_or([0.8, 0.8, 0.8]);
+            Material {
+                albedo: vec3(albedo[0], albedo[1], albedo[2]),
+                _pad0: 0.0,
+                metallic: m.unknown_param.get("Pm").and_then(|s| s.parse().ok()).unwrap_or(0.0),
+                roughness: m.unknown_param.get("Pr").and_then(|s| s.parse().ok()).unwrap_or(0.5),
+                _pad1: [0.0, 0.0],
+            }
+        })
+        .collect()
 }
 
 
@@ -678,11 +900,13 @@ unsafe fn check_physical_device_rt_features(
     let mut rt_pipeline_features = vk::PhysicalDeviceRayTracingPipelineFeaturesKHR::builder();
     let mut accel_struct_features = vk::PhysicalDeviceAccelerationStructureFeaturesKHR::builder();
     let mut bda_features = vk::PhysicalDeviceBufferDeviceAddressFeatures::builder();
+    let mut scalar_block_layout_features = vk::PhysicalDeviceScalarBlockLayoutFeatures::builder();
 
     let mut features2 = vk::PhysicalDeviceFeatures2::builder()
         .push_next(&mut rt_pipeline_features)
         .push_next(&mut accel_struct_features)
-        .push_next(&mut bda_features);
+        .push_next(&mut bda_features)
+        .push_next(&mut scalar_block_layout_features);
 
     instance.get_physical_device_features2(physical_device, &mut features2);
 
@@ -691,6 +915,9 @@ unsafe fn check_physical_device_rt_features(
     }
     if accel_struct_features.acceleration_structure != vk::TRUE {
         return Err(anyhow!(SuitabilityError("Missing acceleration structure feature")));
+    }
+    if scalar_block_layout_features.scalar_block_layout != vk::TRUE {
+        return Err(anyhow!(SuitabilityError("Missing scalarBlockLayout feature")));
     }
     if bda_features.buffer_device_address != vk::TRUE {
         return Err(anyhow!(SuitabilityError("Missing buffer device address feature")));
@@ -766,15 +993,26 @@ unsafe fn create_logical_device(
 
     let mut dynamic_rendering_features = vk::PhysicalDeviceDynamicRenderingFeatures::builder()
         .dynamic_rendering(true);
-
-    let base_features = vk::PhysicalDeviceFeatures::builder();
-
+    
+    let mut scalar_block_layout_features = vk::PhysicalDeviceScalarBlockLayoutFeatures::builder()
+        .scalar_block_layout(true);
+    
+    let base_features = vk::PhysicalDeviceFeatures::builder()
+        .shader_int64(true);
+    
     let mut features2 = vk::PhysicalDeviceFeatures2::builder()
         .features(base_features)
         .push_next(&mut rt_pipeline_features)
         .push_next(&mut accel_struct_features)
         .push_next(&mut bda_features)
-        .push_next(&mut dynamic_rendering_features);
+        .push_next(&mut dynamic_rendering_features)
+        .push_next(&mut scalar_block_layout_features);
+
+    instance.get_physical_device_features2(data.physical_device, &mut features2);
+
+    if features2.features.shader_int64 != vk::TRUE {
+        return Err(anyhow!(SuitabilityError("Missing shaderInt64 feature")));
+    }
 
     let info = vk::DeviceCreateInfo::builder()
         .queue_create_infos(&queue_infos)
@@ -930,9 +1168,24 @@ unsafe fn create_command_buffers(device: &Device, data: &mut AppData) -> Result<
 
     for (i, command_buffer) in data.command_buffers.iter().enumerate() {
         let command_buffer = *command_buffer;
+        let first_query = (i as u32) * 2;
 
         let begin_info = vk::CommandBufferBeginInfo::builder();
         device.begin_command_buffer(command_buffer, &begin_info)?;
+
+        device.cmd_reset_query_pool(
+            command_buffer,
+            data.timestamp_query_pool,
+            first_query,
+            2,
+        );
+
+        device.cmd_write_timestamp(
+            command_buffer,
+            vk::PipelineStageFlags::TOP_OF_PIPE,
+            data.timestamp_query_pool,
+            (i as u32) * 2,
+        );
 
         // Bind rt pipeline
         device.cmd_bind_pipeline(
@@ -1069,6 +1322,13 @@ unsafe fn create_command_buffers(device: &Device, data: &mut AppData) -> Result<
             &[] as &[vk::MemoryBarrier],
             &[] as &[vk::BufferMemoryBarrier],
             &[present_barrier],
+        );
+
+        device.cmd_write_timestamp(
+            command_buffer,
+            vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+            data.timestamp_query_pool,
+            (i as u32) * 2 + 1,
         );
 
         device.end_command_buffer(command_buffer)?;
@@ -1246,43 +1506,6 @@ unsafe fn create_buffer(
     Ok((buffer, buffer_memory))
 }}
 
-unsafe fn copy_buffer(
-    device: &Device,
-    data: &AppData,
-    source: vk::Buffer,
-    destination: vk::Buffer,
-    size: vk::DeviceSize,
-) -> Result<()> { unsafe {
-    let info = vk::CommandBufferAllocateInfo::builder()
-        .level(vk::CommandBufferLevel::PRIMARY)
-        .command_pool(data.command_pool)
-        .command_buffer_count(1);
-
-    let command_buffer = device.allocate_command_buffers(&info)?[0];
-
-    let info = vk::CommandBufferBeginInfo::builder()
-    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-
-    device.begin_command_buffer(command_buffer, &info)?;
-
-    let regions = vk::BufferCopy::builder().size(size);
-    device.cmd_copy_buffer(command_buffer, source, destination, &[regions]);
-
-    device.end_command_buffer(command_buffer)?;
-
-
-    let command_buffers = &[command_buffer];
-    let info = vk::SubmitInfo::builder()
-        .command_buffers(command_buffers);
-
-    device.queue_submit(data.graphics_queue, &[info], vk::Fence::null())?;
-    device.queue_wait_idle(data.graphics_queue)?;
-    
-    device.free_command_buffers(data.command_pool, &[command_buffer]);
-
-    Ok(())
-}}
-
 unsafe fn get_buffer_device_address(
     device: &Device,
     buffer: vk::Buffer,
@@ -1318,6 +1541,67 @@ unsafe fn create_uniform_buffers(
     Ok(())
 }}
 
+unsafe fn create_scene_buffers(
+    instance: &Instance,
+    device: &Device,
+    data: &mut AppData,
+    materials: &[Material],
+    prim_material_ids: &[u32],
+) -> Result<()> { unsafe {
+    // Material buffer
+    let materials_size = (size_of::<Material>() * materials.len().max(1)) as u64;
+    let (materials_buffer, materials_buffer_memory) = create_buffer(
+        instance, device, data, materials_size,
+        vk::BufferUsageFlags::STORAGE_BUFFER,
+        vk::MemoryPropertyFlags::HOST_COHERENT | vk::MemoryPropertyFlags::HOST_VISIBLE,
+    )?;
+    
+    if !materials.is_empty() {
+        let mem = device.map_memory(materials_buffer_memory, 0, materials_size, vk::MemoryMapFlags::empty())?;
+        memcpy(materials.as_ptr().cast::<u8>(), mem.cast::<u8>(), materials_size as usize);
+        device.unmap_memory(materials_buffer_memory);
+    }
+
+    // ObjectDesc buffer
+    let object_descs = vec![ObjectDesc {
+        vertex_address: get_buffer_device_address(device, data.vertex_buffer),
+        index_address: get_buffer_device_address(device, data.index_buffer),
+        material_id: 0,
+        _pad: 0,
+    }];
+    let objects_size = (size_of::<ObjectDesc>() * object_descs.len()) as u64;
+    let (objects_buffer, objects_buffer_memory) = create_buffer(
+        instance, device, data, objects_size,
+        vk::BufferUsageFlags::STORAGE_BUFFER,
+        vk::MemoryPropertyFlags::HOST_COHERENT | vk::MemoryPropertyFlags::HOST_VISIBLE,
+    )?;
+    let mem = device.map_memory(objects_buffer_memory, 0, objects_size, vk::MemoryMapFlags::empty())?;
+    memcpy(object_descs.as_ptr().cast::<u8>(), mem.cast::<u8>(), objects_size as usize);
+    device.unmap_memory(objects_buffer_memory);
+
+    // Material Ids buffer
+    let ids_size = (size_of::<u32>() * prim_material_ids.len()) as u64;
+    let (ids_buffer, ids_buffer_memory) = create_buffer(
+        instance, device, data, ids_size,
+        vk::BufferUsageFlags::STORAGE_BUFFER,
+        vk::MemoryPropertyFlags::HOST_COHERENT | vk::MemoryPropertyFlags::HOST_VISIBLE,
+    )?;
+
+    let mem = device.map_memory(ids_buffer_memory, 0, ids_size, vk::MemoryMapFlags::empty())?;
+    memcpy(prim_material_ids.as_ptr().cast::<u8>(), mem.cast::<u8>(), ids_size as usize);
+    device.unmap_memory(ids_buffer_memory);
+
+    // Store
+    data.materials_buffer = materials_buffer;
+    data.materials_buffer_memory = materials_buffer_memory;
+    data.object_descs_buffer = objects_buffer;
+    data.object_descs_buffer_memory = objects_buffer_memory;
+    data.material_ids_buffer = ids_buffer;
+    data.material_ids_buffer_memory = ids_buffer_memory;
+
+    Ok(())
+}}
+
 
 unsafe fn get_memory_type_index(
     instance: &Instance,
@@ -1341,8 +1625,10 @@ unsafe fn create_blas(
     instance: &Instance,
     device: &Device,
     data: &mut AppData,
+    vertices: &[Vertex],
+    indices: &[u32],
 ) -> Result<()> { unsafe {
-    let vertex_size = (size_of::<Vertex>() * VERTICES.len()) as u64;
+    let vertex_size = (size_of::<Vertex>() * vertices.len()) as u64;
     let (vertex_buffer, vertex_buffer_memory) = create_buffer(
         instance, device, data, vertex_size,
         vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
@@ -1352,32 +1638,48 @@ unsafe fn create_blas(
 
     let mem = device.map_memory(vertex_buffer_memory, 0, vertex_size, vk::MemoryMapFlags::empty())?;
     memcpy(
-        VERTICES.as_ptr().cast::<u8>(),
+        vertices.as_ptr().cast::<u8>(),
         mem.cast::<u8>(),
-        size_of::<Vertex>() * VERTICES.len(),
+        size_of::<Vertex>() * vertices.len(),
     );
     device.unmap_memory(vertex_buffer_memory);
 
+    let index_size = (size_of::<u32>() * indices.len()) as u64;
+    let (index_buffer, index_buffer_memory) = create_buffer(
+        instance, device, data, index_size,
+        vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
+            | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR,
+        vk::MemoryPropertyFlags::HOST_COHERENT | vk::MemoryPropertyFlags::HOST_VISIBLE,
+    )?;
+
+    let mem = device.map_memory(index_buffer_memory, 0, index_size, vk::MemoryMapFlags::empty())?;
+    memcpy(
+        indices.as_ptr().cast::<u8>(),
+        mem.cast::<u8>(),
+        size_of::<u32>() * indices.len(),
+    );
+    device.unmap_memory(index_buffer_memory);
+
+
+    let index_addr = get_buffer_device_address(device, index_buffer);
+    if index_addr == 0 {
+        return Err(anyhow!("BLAS index buffer has a zero device address"));
+    }
 
     let vertex_addr = get_buffer_device_address(device, vertex_buffer);
     if vertex_addr == 0 {
         return Err(anyhow!("BLAS vertex buffer has a zero device address"));
     }
-
-    info!(
-        "BLAS geometry: vertex_addr=0x{:x}, vertex_stride={}, max_vertex={}, primitive_count={}",
-        vertex_addr,
-        size_of::<Vertex>(),
-        2,
-        1,
-    );
     
+    let triangle_count = (indices.len() / 3) as u32;
+
     let triangles_data = vk::AccelerationStructureGeometryTrianglesDataKHR::builder()
         .vertex_format(vk::Format::R32G32B32_SFLOAT)
-        .vertex_data(vk::DeviceOrHostAddressConstKHR {device_address: vertex_addr})
+        .vertex_data(vk::DeviceOrHostAddressConstKHR { device_address: vertex_addr })
         .vertex_stride(size_of::<Vertex>() as u64)
-        .max_vertex(2)
-        .index_type(vk::IndexType::NONE_KHR)
+        .max_vertex(vertices.len() as u32 - 1)
+        .index_type(vk::IndexType::UINT32)
+        .index_data(vk::DeviceOrHostAddressConstKHR { device_address: index_addr })
         .build();
 
     let geometry = vk::AccelerationStructureGeometryKHR::builder()
@@ -1387,7 +1689,6 @@ unsafe fn create_blas(
         .build();
 
     let geometries = &[geometry];
-    let triangle_count = 1u32;
 
     let mut build_info = vk::AccelerationStructureBuildGeometryInfoKHR::builder()
         .type_(vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL)
@@ -1472,6 +1773,9 @@ unsafe fn create_blas(
     data.vertex_buffer = vertex_buffer;
     data.vertex_buffer_memory = vertex_buffer_memory;
 
+    data.index_buffer = index_buffer;
+    data.index_buffer_memory = index_buffer_memory;
+
     data.blas = blas;
     data.blas_buffer = as_buffer;
     data.blas_buffer_memory = as_buffer_memory;
@@ -1490,15 +1794,6 @@ unsafe fn create_tlas(
 
     let blas_address = device.get_acceleration_structure_device_address_khr(&blas_addr_info);
 
-    info!(
-        "Instance: custom_index={}, mask=0x{:x}, sbt_offset={}, flags=0x{:x}, blas_ref=0x{:x}",
-        0,
-        0xFF,
-        0,
-        1,
-        blas_address,
-    );
-
     let transform = vk::TransformMatrixKHR {
         matrix: [
             [1.0, 0.0, 0.0, 0.0],
@@ -1509,9 +1804,11 @@ unsafe fn create_tlas(
 
     let blas_instance = RtAccelerationStructureInstance {
         transform,
-        instance_custom_index_and_mask: 0xFF00_0000,
-        instance_sbt_record_offset_and_flags:
-            vk::GeometryInstanceFlagsKHR::TRIANGLE_FACING_CULL_DISABLE.bits() << 24,
+        instance_custom_index_and_mask: pack_custom_index_and_mask(0, 0xFF),
+        instance_sbt_record_offset_and_flags: pack_sbt_offset_and_flags(
+            0,
+            vk::GeometryInstanceFlagsKHR::TRIANGLE_FACING_CULL_DISABLE,
+        ),
         acceleration_structure_reference: blas_address,
     };
 
@@ -1534,13 +1831,6 @@ unsafe fn create_tlas(
 
 
     let instance_buffer_addr = get_buffer_device_address(device, instance_buffer);
-
-    info!(
-        "TLAS: blas_address=0x{:x}, instance_buffer_address=0x{:x}, instance_size={}",
-        blas_address,
-        instance_buffer_addr,
-        instance_size,
-    );
 
     let instances_data = vk::AccelerationStructureGeometryInstancesDataKHR::builder()
         .array_of_pointers(false)
@@ -1617,14 +1907,6 @@ unsafe fn create_tlas(
     let cmd = device.allocate_command_buffers(&alloc_info)?[0];
 
 
-    let tlas_address = device.get_acceleration_structure_device_address_khr(
-        &vk::AccelerationStructureDeviceAddressInfoKHR::builder()
-            .acceleration_structure(tlas),
-    );
-
-    info!("TLAS address=0x{:x}", tlas_address);
-
-
     let begin_info = vk::CommandBufferBeginInfo::builder()
         .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
 
@@ -1660,13 +1942,14 @@ unsafe fn create_rt_pipeline(
     // Load shaders
     let raygen_bytes = include_bytes!("../shaders/raygen.spv");
     let miss_bytes = include_bytes!("../shaders/miss.spv");
+    let shadow_miss_bytes = include_bytes!("../shaders/shadow.spv"); // compiled from shadow.rmiss
     let chit_bytes = include_bytes!("../shaders/closesthit.spv");
 
     let raygen_module = create_shader_module(device, &raygen_bytes[..])?;
     let miss_module = create_shader_module(device, &miss_bytes[..])?;
+    let shadow_miss_module = create_shader_module(device, &shadow_miss_bytes[..])?;
     let chit_module = create_shader_module(device, &chit_bytes[..])?;
 
-    // Index the shaders
     let raygen_stage = vk::PipelineShaderStageCreateInfo::builder()
         .stage(vk::ShaderStageFlags::RAYGEN_KHR)
         .module(raygen_module)
@@ -1677,25 +1960,37 @@ unsafe fn create_rt_pipeline(
         .module(miss_module)
         .name(b"main\0");
 
+    let shadow_miss_stage = vk::PipelineShaderStageCreateInfo::builder()
+        .stage(vk::ShaderStageFlags::MISS_KHR)
+        .module(shadow_miss_module)
+        .name(b"main\0");
+
     let chit_stage = vk::PipelineShaderStageCreateInfo::builder()
         .stage(vk::ShaderStageFlags::CLOSEST_HIT_KHR)
         .module(chit_module)
         .name(b"main\0");
 
-    let stages = &[raygen_stage, miss_stage, chit_stage];
+    let stages = &[raygen_stage, miss_stage, shadow_miss_stage, chit_stage];
 
 
     // Setup shader groups
     let raygen_group = vk::RayTracingShaderGroupCreateInfoKHR::builder()
         .type_(vk::RayTracingShaderGroupTypeKHR::GENERAL)
-        .general_shader(0)
+        .general_shader(0) // raygen_stage
         .closest_hit_shader(vk::SHADER_UNUSED_KHR)
         .any_hit_shader(vk::SHADER_UNUSED_KHR)
         .intersection_shader(vk::SHADER_UNUSED_KHR);
 
     let miss_group = vk::RayTracingShaderGroupCreateInfoKHR::builder()
         .type_(vk::RayTracingShaderGroupTypeKHR::GENERAL)
-        .general_shader(1)
+        .general_shader(1) // miss_stage
+        .closest_hit_shader(vk::SHADER_UNUSED_KHR)
+        .any_hit_shader(vk::SHADER_UNUSED_KHR)
+        .intersection_shader(vk::SHADER_UNUSED_KHR);
+
+    let shadow_miss_group = vk::RayTracingShaderGroupCreateInfoKHR::builder()
+        .type_(vk::RayTracingShaderGroupTypeKHR::GENERAL)
+        .general_shader(2) // shadow_miss_stage
         .closest_hit_shader(vk::SHADER_UNUSED_KHR)
         .any_hit_shader(vk::SHADER_UNUSED_KHR)
         .intersection_shader(vk::SHADER_UNUSED_KHR);
@@ -1703,11 +1998,11 @@ unsafe fn create_rt_pipeline(
     let hit_group = vk::RayTracingShaderGroupCreateInfoKHR::builder()
         .type_(vk::RayTracingShaderGroupTypeKHR::TRIANGLES_HIT_GROUP)
         .general_shader(vk::SHADER_UNUSED_KHR)
-        .closest_hit_shader(2)
+        .closest_hit_shader(3) // chit_stage
         .any_hit_shader(vk::SHADER_UNUSED_KHR)
         .intersection_shader(vk::SHADER_UNUSED_KHR);
 
-    let groups = &[raygen_group, miss_group, hit_group];
+    let groups = &[raygen_group, miss_group, shadow_miss_group, hit_group];
 
     // Layout pipeline
     let set_layouts = &[data.descriptor_set_layout];
@@ -1720,7 +2015,7 @@ unsafe fn create_rt_pipeline(
     let pipeline_info = vk::RayTracingPipelineCreateInfoKHR::builder()
         .stages(stages)
         .groups(groups)
-        .max_pipeline_ray_recursion_depth(1)
+        .max_pipeline_ray_recursion_depth(2)
         .layout(data.rt_pipeline_layout);
 
     let pipelines = device.create_ray_tracing_pipelines_khr(
@@ -1735,6 +2030,7 @@ unsafe fn create_rt_pipeline(
     // Cleanup
     device.destroy_shader_module(raygen_module, None);
     device.destroy_shader_module(miss_module, None);
+    device.destroy_shader_module(shadow_miss_module, None);
     device.destroy_shader_module(chit_module, None);
 
     Ok(())
@@ -1763,12 +2059,12 @@ unsafe fn create_shader_binding_table(
 
     let handle_size_aligned = align_up(handle_size, handle_alignment);
 
-    let group_count = 3u32;
+    let group_count = 4u32;
 
     // Get group handles
     let handle_data_size = (handle_size * group_count) as usize;
     let mut handle_data = vec![0u8; handle_data_size];
-
+        
     device.get_ray_tracing_shader_group_handles_khr(
         data.rt_pipeline,
         0,
@@ -1776,9 +2072,9 @@ unsafe fn create_shader_binding_table(
         &mut handle_data,
     )?;
 
-    // Compute region sizes
+    // Region sizes
     let raygen_region_size = handle_size_aligned;
-    let miss_region_size = handle_size_aligned;
+    let miss_region_size = handle_size_aligned * 2;
     let hit_region_size = handle_size_aligned;
     let miss_region_offset = align_up(raygen_region_size, base_alignment);
     let hit_region_offset = align_up(miss_region_offset + miss_region_size, base_alignment);
@@ -1797,20 +2093,26 @@ unsafe fn create_shader_binding_table(
     let mem = device.map_memory(sbt_buffer_memory, 0, sbt_size, vk::MemoryMapFlags::empty())?;
     let mem_ptr = mem as *mut u8;
 
-    memcpy(
-        handle_data.as_ptr(),
-        mem_ptr,
-        handle_size as usize,
-    );
+    // Raygen
+    memcpy(handle_data.as_ptr(), mem_ptr, handle_size as usize);
 
+    // Miss (sky)
     memcpy(
         handle_data.as_ptr().add(handle_size as usize),
         mem_ptr.add(miss_region_offset as usize),
         handle_size as usize,
     );
 
+    // Miss (shadow)
     memcpy(
         handle_data.as_ptr().add((handle_size * 2) as usize),
+        mem_ptr.add((miss_region_offset + handle_size_aligned) as usize),
+        handle_size as usize,
+    );
+
+    // Hit
+    memcpy(
+        handle_data.as_ptr().add((handle_size * 3) as usize),
         mem_ptr.add(hit_region_offset as usize),
         handle_size as usize,
     );
@@ -1856,25 +2158,56 @@ unsafe fn create_descriptor_set_layout(
     device: &Device,
     data: &mut AppData,
 ) -> Result<()> { unsafe {
+    let rt_stages = vk::ShaderStageFlags::RAYGEN_KHR
+        | vk::ShaderStageFlags::CLOSEST_HIT_KHR
+        | vk::ShaderStageFlags::MISS_KHR;
+
     let as_binding = vk::DescriptorSetLayoutBinding::builder()
         .binding(0)
         .descriptor_type(vk::DescriptorType::ACCELERATION_STRUCTURE_KHR)
         .descriptor_count(1)
-        .stage_flags(vk::ShaderStageFlags::RAYGEN_KHR);
+        .stage_flags(rt_stages);
 
     let image_binding = vk::DescriptorSetLayoutBinding::builder()
         .binding(1)
         .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
         .descriptor_count(1)
-        .stage_flags(vk::ShaderStageFlags::RAYGEN_KHR);
+        .stage_flags(rt_stages);
 
     let ubo_binding = vk::DescriptorSetLayoutBinding::builder()
         .binding(2)
         .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
         .descriptor_count(1)
-        .stage_flags(vk::ShaderStageFlags::RAYGEN_KHR);
+        .stage_flags(rt_stages);
 
-    let bindings = &[as_binding, image_binding, ubo_binding];
+    let object_descs_binding = vk::DescriptorSetLayoutBinding::builder()
+        .binding(3)
+        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+        .descriptor_count(1)
+        .stage_flags(rt_stages);
+
+    let materials_binding = vk::DescriptorSetLayoutBinding::builder()
+        .binding(4)
+        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+        .descriptor_count(1)
+        .stage_flags(rt_stages);
+
+    let material_ids_binding = vk::DescriptorSetLayoutBinding::builder()
+        .binding(5)
+        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+        .descriptor_count(1)
+        .stage_flags(rt_stages);
+
+
+    let bindings = &[
+        as_binding,
+        image_binding,
+        ubo_binding,
+        object_descs_binding,
+        materials_binding,
+        material_ids_binding,
+    ];
+
     let info = vk::DescriptorSetLayoutCreateInfo::builder()
         .bindings(bindings);
 
@@ -1896,7 +2229,19 @@ unsafe fn create_descriptor_pool(device: &Device, data: &mut AppData) -> Result<
         .type_(vk::DescriptorType::UNIFORM_BUFFER)
         .descriptor_count(data.swapchain_images.len() as u32);
 
-    let pool_sizes = &[as_size, image_size, ubo_size];
+    let object_descs_size = vk::DescriptorPoolSize::builder()
+        .type_(vk::DescriptorType::STORAGE_BUFFER)
+        .descriptor_count(data.swapchain_images.len() as u32);
+
+    let materials_size = vk::DescriptorPoolSize::builder()
+        .type_(vk::DescriptorType::STORAGE_BUFFER)
+        .descriptor_count(data.swapchain_images.len() as u32);
+
+    let storage_buffer_size = vk::DescriptorPoolSize::builder()
+        .type_(vk::DescriptorType::STORAGE_BUFFER)
+        .descriptor_count((data.swapchain_images.len() * 3) as u32);
+
+    let pool_sizes = &[as_size, image_size, ubo_size, object_descs_size, materials_size, storage_buffer_size];
     let info = vk::DescriptorPoolCreateInfo::builder()
         .pool_sizes(pool_sizes)
         .max_sets(data.swapchain_images.len() as u32);
@@ -1959,8 +2304,52 @@ unsafe fn create_descriptor_sets(device: &Device, data: &mut AppData) -> Result<
             .buffer_info(std::slice::from_ref(&buffer_info))
             .build();
 
+        // Material write
+        let object_descs_info = vk::DescriptorBufferInfo::builder()
+            .buffer(data.object_descs_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)
+            .build();
+
+        let object_descs_write = vk::WriteDescriptorSet::builder()
+            .dst_set(data.descriptor_sets[i])
+            .dst_binding(3)
+            .dst_array_element(0)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(std::slice::from_ref(&object_descs_info))
+            .build();
+
+        let materials_info = vk::DescriptorBufferInfo::builder()
+            .buffer(data.materials_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)
+            .build();
+
+        let materials_write = vk::WriteDescriptorSet::builder()
+            .dst_set(data.descriptor_sets[i])
+            .dst_binding(4)
+            .dst_array_element(0)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(std::slice::from_ref(&materials_info))
+            .build();
+
+        let material_ids_info = vk::DescriptorBufferInfo::builder()
+            .buffer(data.material_ids_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)
+            .build();
+
+        let material_ids_write = vk::WriteDescriptorSet::builder()
+            .dst_set(data.descriptor_sets[i])
+            .dst_binding(5)
+            .dst_array_element(0)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(std::slice::from_ref(&material_ids_info))
+            .build();
+
+
         device.update_descriptor_sets(
-            &[as_write, image_write, ubo_write],
+            &[as_write, image_write, ubo_write, object_descs_write, materials_write, material_ids_write],
             &[] as &[vk::CopyDescriptorSet],
         );
     }
@@ -1985,6 +2374,13 @@ fn main() -> Result<()> {
     
     let mut minimized = false;
 
+    let mut cursor_grabbed = true;
+    window.set_cursor_visible(false);
+    window.set_cursor_grab(winit::window::CursorGrabMode::Confined)
+        .or_else(|_e| window.set_cursor_grab(winit::window::CursorGrabMode::Locked))
+        .ok();
+
+
     event_loop.run(move |event, elwt| {
         match event {
             Event::AboutToWait => {
@@ -2006,7 +2402,7 @@ fn main() -> Result<()> {
 
                     if elapsed >= Duration::from_secs(1) {
                         let fps = frames as f64 / elapsed.as_secs_f64();
-                        let ms = elapsed.as_secs_f64() * 1000.0 / frames as f64;
+                        let ms = app.frame_time;
 
                         window.set_title(&format!(
                             "Vulkan - {:.0} FPS ({:.2} ms)",
@@ -2040,6 +2436,45 @@ fn main() -> Result<()> {
                 }
 
                 elwt.exit();
+            }
+
+            Event::WindowEvent {
+                event: WindowEvent::KeyboardInput { event: key_event, .. }, ..
+            } => {
+                let pressed = key_event.state == winit::event::ElementState::Pressed;
+                
+                match key_event.physical_key {
+                    winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::KeyW) => app.input.forward = pressed,
+                    winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::KeyS) => app.input.back = pressed,
+                    winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::KeyA) => app.input.left = pressed,
+                    winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::KeyD) => app.input.right = pressed,
+                    winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::Space) => app.input.up = pressed,
+                    winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::ControlLeft) => app.input.down = pressed,
+
+                    winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::Escape) => {
+                        if pressed {
+                            cursor_grabbed = !cursor_grabbed;
+                            app.controls_enabled = cursor_grabbed;
+
+                            window.set_cursor_visible(!cursor_grabbed);
+                            if cursor_grabbed {
+                                window.set_cursor_grab(winit::window::CursorGrabMode::Confined)
+                                    .or_else(|_e| window.set_cursor_grab(winit::window::CursorGrabMode::Locked))
+                                    .ok();
+                            } else {
+                                window.set_cursor_grab(winit::window::CursorGrabMode::None).ok();
+                            }
+                        }
+                    },
+                    _ => {}
+                }
+            }
+
+            Event::DeviceEvent {
+                event: winit::event::DeviceEvent::MouseMotion {delta}, ..
+            } => {
+                app.input.mouse_dx += delta.0 as f32;
+                app.input.mouse_dy += delta.1 as f32;
             }
 
             _ => {}
