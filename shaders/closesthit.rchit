@@ -92,7 +92,7 @@ void main() {
         1
     );
 
-    const float ambient = 0.01;
+    const float ambient = 0.025;
     float lighting = max(dot(normal, sunLightDir), 0.0);
     float shadowFactor = shadowed ? 0.0 : 1.0;
     hitColor = mat.albedo * max(lighting * shadowFactor, ambient);

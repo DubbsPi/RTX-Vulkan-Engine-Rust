@@ -21,6 +21,9 @@ use std::os::raw::c_void;
 use std::time::{Duration, Instant};
 use std::mem::size_of;
 use std::ptr::copy_nonoverlapping as memcpy;
+use std::io::{Read, Write, BufReader, BufWriter};
+use std::fs::File;
+use std::path::Path;
 
 use winit::window::{Window, WindowBuilder};
 use winit::event::{Event, WindowEvent};
@@ -171,8 +174,8 @@ impl App {
         create_descriptor_set_layout(&device, &mut data)?; 
         create_rt_pipeline(&device, &mut data)?;
 
-        let (vertices, indices, prim_material_ids, materials) = load_obj(
-            "models/plant.obj", 5.0
+        let (vertices, indices, prim_material_ids, materials) = load_obj_cached(
+            "models/plant.obj", 0.2
         )?;
 
         info!("Triangles: {}, Vertices: {}", indices.len() / 3, vertices.len());
@@ -304,7 +307,7 @@ impl App {
         )?;
 
 
-        if self.frame_time != 0.0 || self.frame >= MAX_FRAMES_IN_FLIGHT {
+        if self.start.elapsed() > Duration::ZERO {
             let mut timestamps = [0u64; 2];
             let query_result = self.device.get_query_pool_results(
                 self.data.timestamp_query_pool,
@@ -694,6 +697,16 @@ struct RtAccelerationStructureInstance {
 }
 
 
+#[repr(C)]
+struct BinHeader {
+    magic: [u8; 4],
+    version: u32,
+    vertex_count: u64,
+    index_count: u64,
+    material_count: u64,
+}
+
+
 // Utility functions
 fn pack_custom_index_and_mask(custom_index: u32, mask: u8) -> u32 {
     (custom_index & 0x00FF_FFFF) | ((mask as u32) << 24)
@@ -792,6 +805,98 @@ fn convert_materials(tobj_materials: &[tobj::Material]) -> Vec<Material> {
             }
         })
         .collect()
+}
+
+fn cache_path(obj_path: &str) -> String {
+    format!("models/binaries/{}.bin", 
+        Path::new(obj_path).file_stem().unwrap().to_str().unwrap())
+}
+
+fn load_obj_cached(path: &str, scale: f32) -> Result<(Vec<Vertex>, Vec<u32>, Vec<u32>, Vec<Material>)> {
+    let bin_path = cache_path(path);
+
+    if Path::new(&bin_path).exists() {
+        info!("Loading cached binary: {}", bin_path);
+        return load_binary(&bin_path);
+    }
+
+    info!("No cache found, parsing OBJ (this may take a while)...");
+    let result = load_obj(path, scale)?;
+    save_binary(&bin_path, &result)?;
+    Ok(result)
+}
+
+fn save_binary(
+    path: &str, 
+    data: &(Vec<Vertex>, Vec<u32>, Vec<u32>, Vec<Material>)
+) -> Result<()> {
+    std::fs::create_dir_all("models/binaries")?;
+    let (vertices, indices, material_ids, materials) = data;
+    let mut w = BufWriter::new(File::create(path)?);
+
+    let header = BinHeader {
+        magic: *b"VKRT",
+        version: 1,
+        vertex_count: vertices.len() as u64,
+        index_count: indices.len() as u64,
+        material_count: materials.len() as u64,
+    };
+
+    unsafe {
+        w.write_all(as_bytes(&header))?;
+        w.write_all(as_slice_bytes(vertices))?;
+        w.write_all(as_slice_bytes(indices))?;
+        w.write_all(as_slice_bytes(material_ids))?;
+        w.write_all(as_slice_bytes(materials))?;
+    }
+    Ok(())
+}
+
+fn load_binary(path: &str) -> Result<(Vec<Vertex>, Vec<u32>, Vec<u32>, Vec<Material>)> {
+    let mut r = BufReader::new(File::open(path)?);
+
+    let mut header = BinHeader { 
+        magic: [0;4], version: 0, 
+        vertex_count: 0, index_count: 0, material_count: 0 
+    };
+    unsafe {r.read_exact(as_bytes_mut(&mut header))?;}
+    
+    if &header.magic != b"VKRT" {
+        return Err(anyhow!("Bad cache file magic, deleting and reparsing"));
+    }
+    if header.version != 1 {
+        return Err(anyhow!("Cache version mismatch"));
+    }
+
+    let vertices = read_vec::<Vertex>(&mut r, header.vertex_count as usize)?;
+    let indices = read_vec::<u32>(&mut r, header.index_count as usize)?;
+    let material_ids = read_vec::<u32>(&mut r, header.index_count as usize / 3)?;
+    let materials = read_vec::<Material>(&mut r, header.material_count as usize)?;
+
+    Ok((vertices, indices, material_ids, materials))
+}
+
+unsafe fn as_bytes<T>(t: &T) -> &[u8] { unsafe {
+    std::slice::from_raw_parts((t as *const T).cast::<u8>(), size_of::<T>())
+}}
+
+unsafe fn as_bytes_mut<T>(t: &mut T) -> &mut [u8] { unsafe {
+    std::slice::from_raw_parts_mut((t as *mut T).cast::<u8>(), size_of::<T>())
+}}
+
+unsafe fn as_slice_bytes<T>(s: &[T]) -> &[u8] { unsafe {
+    std::slice::from_raw_parts(s.as_ptr().cast::<u8>(), s.len() * size_of::<T>())
+}}
+
+fn read_vec<T: Copy>(r: &mut impl Read, count: usize) -> Result<Vec<T>> {
+    let mut v: Vec<T> = Vec::with_capacity(count);
+    unsafe {
+        v.set_len(count);
+        r.read_exact(std::slice::from_raw_parts_mut(
+            v.as_mut_ptr().cast::<u8>(), count * size_of::<T>()
+        ))?;
+    }
+    Ok(v)
 }
 
 
@@ -1094,13 +1199,9 @@ fn get_swapchain_surface_format(
 }
 
 fn get_swapchain_present_mode(
-    present_modes: &[vk::PresentModeKHR],
+    _present_modes: &[vk::PresentModeKHR],
 ) -> vk::PresentModeKHR {
-    present_modes
-        .iter()
-        .cloned()
-        .find(|m| *m == vk::PresentModeKHR::MAILBOX)
-        .unwrap_or(vk::PresentModeKHR::FIFO)
+    vk::PresentModeKHR::FIFO
 }
 
 fn get_swapchain_extent(

@@ -19,5 +19,6 @@ layout(binding = 2, set = 0) uniform CameraUBO {
 
 
 void main() {
-    hitColor = getSky(gl_WorldRayDirectionEXT, sunLightDir, cam.viewInverse[3].y);
+    //hitColor = getSky(gl_WorldRayDirectionEXT, sunLightDir, cam.viewInverse[3].y);
+    hitColor = vec3(0, 0, 0.5);
 }
