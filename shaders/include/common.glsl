@@ -83,7 +83,7 @@ float opticalDepth(in vec3 pos, in vec3 dir, in float rayLength, in float scaleH
 }
 
 vec3 scatterAtmosphere(in vec3 viewDir, in vec3 sunDir, in float cameraY) {
-    vec3 origin = vec3(0, earthRadius + cameraY, 0);
+    vec3 origin = vec3(0, earthRadius + max(cameraY, 5.0), 0);
 
     // Get the atmospheric exit
     vec2 atmoHit = intersectSphereSky(origin, viewDir, atmosphereRadius);

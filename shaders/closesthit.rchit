@@ -11,8 +11,6 @@
 layout(location = 0) rayPayloadInEXT vec3 hitColor;
 layout(location = 1) rayPayloadEXT bool shadowed;
 
-layout(location = 1) rayPayloadEXT bool shadowed;
-
 hitAttributeEXT vec2 attribs;
 
 layout(binding = 2, set = 0) uniform CameraUBO {
