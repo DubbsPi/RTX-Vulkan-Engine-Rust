@@ -28,6 +28,8 @@ use winit::event_loop::EventLoop;
 
 use cgmath::{vec3, point3, Deg};
 use cgmath::SquareMatrix;
+use cgmath::InnerSpace;
+use cgmath::Zero;
 
 
 type Vec3 = cgmath::Vector3<f32>;
@@ -129,7 +131,14 @@ struct App {
 
     frame: usize,
     resized: bool,
+
+    last_frame: Instant,
+    frame_time: f64,
     start: Instant,
+
+    camera: Camera,
+    input: InputState,
+    controls_enabled: bool,
 }
 
 impl App {
@@ -162,7 +171,13 @@ impl App {
         create_descriptor_set_layout(&device, &mut data)?; 
         create_rt_pipeline(&device, &mut data)?;
 
-        create_blas(&instance, &device, &mut data)?;
+        let (vertices, indices, prim_material_ids, materials) = load_obj(
+            "models/plant.obj", 5.0
+        )?;
+
+        info!("Triangles: {}, Vertices: {}", indices.len() / 3, vertices.len());
+
+        create_blas(&instance, &device, &mut data, &vertices, &indices)?;
         create_tlas(&instance, &device, &mut data)?;
 
         create_scene_buffers(&instance, &device, &mut data, &materials, &prim_material_ids)?;
@@ -179,9 +194,20 @@ impl App {
         
         let frame = 0;
         let resized = false;
+        let last_frame = Instant::now();
+        let frame_time = 0.0;
+
+        let camera = Camera::new();
+        let input = InputState::default();
+        let controls_enabled = true;
         let start = Instant::now();
 
-        Ok(Self {_entry, instance: instance, data, device, frame, resized, start})
+        Ok(Self {
+            _entry, instance: instance, data, device,
+            frame, resized,
+            last_frame, frame_time, start,
+            camera, input, controls_enabled
+        })
     }}
 
     unsafe fn destroy(&mut self) { unsafe {
@@ -207,6 +233,17 @@ impl App {
         self.device.destroy_buffer(self.data.vertex_buffer, None);
         self.device.free_memory(self.data.vertex_buffer_memory, None);
 
+        // Material buffers
+        self.device.destroy_buffer(self.data.materials_buffer, None);
+        self.device.free_memory(self.data.materials_buffer_memory, None);
+        self.device.destroy_buffer(self.data.object_descs_buffer, None);
+        self.device.free_memory(self.data.object_descs_buffer_memory, None);
+
+        self.device.destroy_buffer(self.data.material_ids_buffer, None);
+        self.device.free_memory(self.data.material_ids_buffer_memory, None);
+
+
+        self.device.destroy_query_pool(self.data.timestamp_query_pool, None);
         self.device.destroy_descriptor_set_layout(self.data.descriptor_set_layout, None);
 
 
@@ -400,16 +437,7 @@ impl App {
 
     unsafe fn update_uniform_buffer(&self, image_index: usize) -> Result<()> { unsafe {
         let time = self.start.elapsed().as_secs_f32();
-
-        let camera_pos = point3(0.0, 0.0, -2.5);
-        let mut camera_dir = [time.sin(), 0.0, 3.0];
-        normalize(&mut camera_dir);
-        
-        let view = Mat4::look_at_rh(
-            camera_pos, 
-            point3(camera_pos[0] + camera_dir[0], camera_pos[1] + camera_dir[1], camera_pos[2] + camera_dir[2]),
-            vec3(0.0, 1.0, 0.0),
-        );
+        let view = self.camera.view_matrix();
 
         let mut proj = cgmath::perspective(
             Deg(45.0),
@@ -567,13 +595,83 @@ pub struct SuitabilityError(pub &'static str);
 #[derive(Copy, Clone, Debug)]
 struct Vertex {
     pos: Vec3,
-    color: Vec3,
+    normal: Vec3,
 }
 
 impl Vertex {
-    const fn new(pos: Vec3, color: Vec3) -> Self {
-        Self {pos, color}
+    const fn new(pos: Vec3, normal: Vec3) -> Self {
+        Self {pos, normal}
     }
+}
+
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+struct Material {
+    albedo: Vec3,
+    _pad0: f32,
+    metallic: f32,
+    roughness: f32,
+    _pad1: [f32; 2],
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+struct ObjectDesc {
+    vertex_address: u64,
+    index_address: u64,
+    material_id: u32,
+    _pad: u32,
+}
+
+
+struct Camera {
+    position: cgmath::Point3<f32>,
+    yaw: f32,
+    pitch: f32,
+    speed: f32,
+    sensitivity: f32,
+}
+
+impl Camera {
+    fn new() -> Self {
+        Self {
+            position: point3(0.0, 0.0, -2.5),
+            yaw: 90.0_f32.to_radians(),
+            pitch: 0.0,
+            speed: 2.5,
+            sensitivity: 0.0025,
+        }
+    }
+
+    fn forward(&self) -> Vec3 {
+        vec3(
+            self.yaw.cos() * self.pitch.cos(),
+            self.pitch.sin(),
+            self.yaw.sin() * self.pitch.cos(),
+        )
+    }
+
+    fn right(&self) -> Vec3 {
+        self.forward().cross(vec3(0.0, 1.0, 0.0)).normalize()
+    }
+
+    fn view_matrix(&self) -> Mat4 {
+        Mat4::look_at_rh(self.position, self.position + self.forward(), vec3(0.0, 1.0, 0.0))
+    }
+}
+
+
+#[derive(Default)]
+struct InputState {
+    forward: bool,
+    back: bool,
+    left: bool,
+    right: bool,
+    up: bool,
+    down: bool,
+    mouse_dx: f32,
+    mouse_dy: f32,
 }
 
 
@@ -596,13 +694,104 @@ struct RtAccelerationStructureInstance {
 }
 
 
-fn normalize(v: &mut [f32; 3]) {
-    let length = (v[0].powi(2) + v[1].powi(2) + v[2].powi(2)).sqrt();
-    if length != 0.0 {
-        v[0] /= length;
-        v[1] /= length;
-        v[2] /= length;
+// Utility functions
+fn pack_custom_index_and_mask(custom_index: u32, mask: u8) -> u32 {
+    (custom_index & 0x00FF_FFFF) | ((mask as u32) << 24)
+}
+
+fn pack_sbt_offset_and_flags(sbt_offset: u32, flags: vk::GeometryInstanceFlagsKHR) -> u32 {
+    (sbt_offset & 0x00FF_FFFF) | ((flags.bits() as u32) << 24)
+}
+
+fn load_obj(path: &str, scale: f32) -> Result<(Vec<Vertex>, Vec<u32>, Vec<u32>, Vec<Material>)> {
+    let (models, materials) = tobj::load_obj(
+        path,
+        &tobj::LoadOptions {
+            triangulate: true,
+            single_index: true,
+            ..Default::default()
+        },
+    )?;
+
+    let converted_materials = convert_materials(&materials.unwrap_or_default());
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+    let mut material_ids = Vec::new();
+
+    for model in &models {
+        let mesh = &model.mesh;
+        let vertex_offset = vertices.len() as u32;
+
+        let triangle_count = mesh.indices.len() / 3;
+        let mat_id = mesh.material_id.unwrap_or(0) as u32;
+
+        material_ids.extend(std::iter::repeat(mat_id).take(triangle_count));
+
+        let positions: Vec<Vec3> = mesh
+            .positions
+            .chunks(3)
+            .map(|p| vec3(p[0] * scale, p[1] * scale, p[2] * scale))
+            .collect();
+
+        let normals: Vec<Vec3> = if mesh.normals.is_empty() {
+            compute_vertex_normals(&positions, &mesh.indices)
+        } else {
+            mesh.normals
+                .chunks(3)
+                .map(|n| vec3(n[0], n[1], n[2]))
+                .collect()
+        };
+
+        vertices.extend(
+            positions
+                .iter()
+                .zip(normals.iter())
+                .map(|(&p, &n)| Vertex::new(p, n)),
+        );
+
+        indices.extend(mesh.indices.iter().map(|i| i + vertex_offset));
     }
+
+    Ok((vertices, indices, material_ids, converted_materials))
+}
+
+fn compute_vertex_normals(positions: &[Vec3], indices: &[u32]) -> Vec<Vec3> {
+    let mut normals = vec![Vec3::zero(); positions.len()];
+
+    for tri in indices.chunks(3) {
+        let (i0, i1, i2) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
+        let (v0, v1, v2) = (positions[i0], positions[i1], positions[i2]);
+
+        let face_normal = (v1 - v0).cross(v2 - v0);
+
+        normals[i0] += face_normal;
+        normals[i1] += face_normal;
+        normals[i2] += face_normal;
+    }
+
+    for n in &mut normals {
+        if n.x * n.x + n.y * n.y + n.z * n.z > 0.0 {
+            *n = n.normalize();
+        }
+    }
+
+    normals
+}
+
+fn convert_materials(tobj_materials: &[tobj::Material]) -> Vec<Material> {
+    tobj_materials
+        .iter()
+        .map(|m| {
+            let albedo = m.diffuse.unwrap_or([0.8, 0.8, 0.8]);
+            Material {
+                albedo: vec3(albedo[0], albedo[1], albedo[2]),
+                _pad0: 0.0,
+                metallic: m.unknown_param.get("Pm").and_then(|s| s.parse().ok()).unwrap_or(0.0),
+                roughness: m.unknown_param.get("Pr").and_then(|s| s.parse().ok()).unwrap_or(0.5),
+                _pad1: [0.0, 0.0],
+            }
+        })
+        .collect()
 }
 
 
