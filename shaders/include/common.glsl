@@ -5,9 +5,10 @@
 #extension GL_EXT_buffer_reference2 : require
 #extension GL_EXT_scalar_block_layout : require
 #extension GL_EXT_ray_tracing : require
+#extension GL_EXT_nonuniform_qualifier : require
 
 
-const vec3 sunLightDir = normalize(vec3(0.5, 1, -0.2));
+const vec3 sunLightDir = normalize(vec3(-1, 0.1, 0.5));
 
 #define SKY_VIEW_SAMPLES 12
 #define SKY_LIGHT_SAMPLES 6
@@ -25,6 +26,7 @@ const float hm = 1200.0;
 struct Vertex {
     vec3 v;
     vec3 n;
+    vec2 uv;
 };
 
 
@@ -45,7 +47,7 @@ struct ObjectDesc {
 
 struct Material {
     vec3 albedo;
-    float pad0;
+    int albedo_texture_index;
     float metallic;
     float roughness;
     vec2 pad1;

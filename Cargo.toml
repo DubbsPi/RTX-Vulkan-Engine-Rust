@@ -11,5 +11,7 @@ png = "0.17"
 pretty_env_logger = "0.5"
 thiserror = "1"
 tobj = { version = "4", features = ["log"] }
+gltf = "1.4"
 vulkanalia = { version = "=0.35.0", features = ["libloading", "provisional", "window"] }
 winit = "0.29"
+bytemuck = "1.25.2"

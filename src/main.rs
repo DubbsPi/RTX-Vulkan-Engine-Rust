@@ -29,12 +29,15 @@ use winit::window::{Window, WindowBuilder};
 use winit::event::{Event, WindowEvent};
 use winit::event_loop::EventLoop;
 
-use cgmath::{vec3, point3, Deg};
+use cgmath::{Deg, Point3, Vector2, vec3};
 use cgmath::SquareMatrix;
 use cgmath::InnerSpace;
 use cgmath::Zero;
 
+use gltf::image::Format::*;
 
+
+type Vec2 = cgmath::Vector2<f32>;
 type Vec3 = cgmath::Vector3<f32>;
 type Mat4 = cgmath::Matrix4<f32>;
 
@@ -50,6 +53,7 @@ const DEVICE_EXTENSIONS: &[vk::ExtensionName] = &[
     vk::KHR_RAY_TRACING_PIPELINE_EXTENSION.name,
     vk::KHR_DEFERRED_HOST_OPERATIONS_EXTENSION.name,
     vk::KHR_BUFFER_DEVICE_ADDRESS_EXTENSION.name,
+    vk::EXT_DESCRIPTOR_INDEXING_EXTENSION.name,
 ];
 
 const MAX_FRAMES_IN_FLIGHT: usize = 3;
@@ -160,6 +164,7 @@ impl App {
         let query_pool_info = vk::QueryPoolCreateInfo::builder()
             .query_type(vk::QueryType::TIMESTAMP)
             .query_count(2 * MAX_FRAMES_IN_FLIGHT as u32);
+        data.queries_valid = [false; MAX_FRAMES_IN_FLIGHT];
 
         data.timestamp_query_pool = device.create_query_pool(&query_pool_info, None)?;
 
@@ -171,14 +176,49 @@ impl App {
         create_command_pool(&instance, &device, &mut data)?;
         create_storage_image(&instance, &device, &mut data)?;
 
-        create_descriptor_set_layout(&device, &mut data)?; 
-        create_rt_pipeline(&device, &mut data)?;
 
-        let (vertices, indices, prim_material_ids, materials) = load_obj_cached(
-            "models/plant.obj", 0.2
+        let mut vertices = Vec::new();
+        let mut indices = Vec::new();
+        let mut prim_material_ids = Vec::new();
+        let mut materials = Vec::new();
+
+        // Truck
+        add_model_to_scene(
+            "models/gmc-sierra-hd2500/source/gmc.glb", 1.0, Vec3::new(0.0, 1.0, 5.0),
+            &mut vertices, &mut indices, &mut prim_material_ids, &mut materials,
+            &instance, &device, &mut data
         )?;
 
+        add_model_to_scene(
+            "models/plant.obj", 1.0, Vec3::new(0.0, 1.75, 2.5),
+            &mut vertices, &mut indices, &mut prim_material_ids, &mut materials,
+            &instance, &device, &mut data
+        )?;
+
+
+        // Ground plane
+        let ground_vertex_offset = vertices.len() as u32;
+        let ground_size = 25.0;
+        let ground_y = 0.0;
+
+        vertices.extend([
+            Vertex::new(vec3(-ground_size, ground_y, -ground_size), vec3(0.0, 1.0, 0.0), None),
+            Vertex::new(vec3(ground_size, ground_y, -ground_size), vec3(0.0, 1.0, 0.0), None),
+            Vertex::new(vec3(ground_size, ground_y, ground_size), vec3(0.0, 1.0, 0.0), None),
+            Vertex::new(vec3(-ground_size, ground_y, ground_size), vec3(0.0, 1.0, 0.0), None),
+        ]);
+
+        indices.extend([
+            ground_vertex_offset, ground_vertex_offset + 1, ground_vertex_offset + 2,
+            ground_vertex_offset, ground_vertex_offset + 2, ground_vertex_offset + 3,
+        ]);
+        
+        
+        data.texture_sampler = create_texture_sampler(&device)?;
         info!("Triangles: {}, Vertices: {}", indices.len() / 3, vertices.len());
+
+        create_descriptor_set_layout(&device, &mut data)?;
+        create_rt_pipeline(&device, &mut data)?;
 
         create_blas(&instance, &device, &mut data, &vertices, &indices)?;
         create_tlas(&instance, &device, &mut data)?;
@@ -200,7 +240,7 @@ impl App {
         let last_frame = Instant::now();
         let frame_time = 0.0;
 
-        let camera = Camera::new();
+        let camera = Camera::new(Point3::new(0.0, 1.0, 0.0));
         let input = InputState::default();
         let controls_enabled = true;
         let start = Instant::now();
@@ -245,7 +285,16 @@ impl App {
         self.device.destroy_buffer(self.data.material_ids_buffer, None);
         self.device.free_memory(self.data.material_ids_buffer_memory, None);
 
+        // Textures
+        self.device.destroy_sampler(self.data.texture_sampler, None);
 
+        for (image, memory, view) in self.data.textures.drain(..) {
+            self.device.destroy_image_view(view, None);
+            self.device.destroy_image(image, None);
+            self.device.free_memory(memory, None);
+        }
+
+        // Pools and descriptor sets
         self.device.destroy_query_pool(self.data.timestamp_query_pool, None);
         self.device.destroy_descriptor_set_layout(self.data.descriptor_set_layout, None);
 
@@ -307,7 +356,7 @@ impl App {
         )?;
 
 
-        if self.start.elapsed() > Duration::ZERO {
+        if self.data.queries_valid[self.frame] {
             let mut timestamps = [0u64; 2];
             let query_result = self.device.get_query_pool_results(
                 self.data.timestamp_query_pool,
@@ -383,6 +432,8 @@ impl App {
             &[submit_info],
             self.data.in_flight_fences[self.frame],
         )?;
+
+        self.data.queries_valid[self.frame] = true;
         
         let swapchains = &[self.data.swapchain];
         let image_indices = &[image_index as u32];
@@ -433,6 +484,7 @@ impl App {
 
         create_command_buffers(&self.device, &mut self.data)?;
 
+        self.data.queries_valid = [false; MAX_FRAMES_IN_FLIGHT];
         self.data.images_in_flight = vec![vk::Fence::null(); self.data.swapchain_images.len()];
 
         Ok(())
@@ -450,7 +502,6 @@ impl App {
         );
 
         proj[1][1] *= -1.0; // Invert Y for Vulkan coordinate space
-        proj[0][0] *= -1.0; // Invert X for me
 
         let view_inverse = view.invert().ok_or_else(|| anyhow!("Failed to invert view matrix"))?;
         let proj_inverse = proj.invert().ok_or_else(|| anyhow!("Failed to invert proj matrix"))?;
@@ -481,7 +532,7 @@ impl App {
 
     fn update_camera(&mut self, dt: f32) {
         if self.controls_enabled {
-            self.camera.yaw -= self.input.mouse_dx * self.camera.sensitivity;
+            self.camera.yaw += self.input.mouse_dx * self.camera.sensitivity;
             self.camera.pitch -= self.input.mouse_dy * self.camera.sensitivity;
             self.camera.pitch = self.camera.pitch.clamp(-1.55, 1.55);
 
@@ -494,8 +545,8 @@ impl App {
 
             if self.input.forward { delta += forward; }
             if self.input.back    { delta -= forward; }
-            if self.input.right   { delta -= right; }
-            if self.input.left    { delta += right; }
+            if self.input.right   { delta += right; }
+            if self.input.left    { delta -= right; }
             if self.input.up      { delta.y += 1.0; }
             if self.input.down    { delta.y -= 1.0; }
 
@@ -543,6 +594,10 @@ struct AppData {
     material_ids_buffer: vk::Buffer,
     material_ids_buffer_memory: vk::DeviceMemory,
 
+    // Textures
+    textures: Vec<(vk::Image, vk::DeviceMemory, vk::ImageView)>,
+    texture_sampler: vk::Sampler,
+
     // Blas
     blas: vk::AccelerationStructureKHR,
     blas_buffer: vk::Buffer,
@@ -586,6 +641,7 @@ struct AppData {
     // Frametime polling
     timestamp_query_pool: vk::QueryPool,
     timestamp_period: f32,
+    queries_valid: [bool; MAX_FRAMES_IN_FLIGHT],
 }
 
 
@@ -599,11 +655,15 @@ pub struct SuitabilityError(pub &'static str);
 struct Vertex {
     pos: Vec3,
     normal: Vec3,
+    uv: Vec2,
 }
 
 impl Vertex {
-    const fn new(pos: Vec3, normal: Vec3) -> Self {
-        Self {pos, normal}
+    const fn new(pos: Vec3, normal: Vec3, uv: Option<Vec2>) -> Self {
+        match uv {
+            Some(a) => Self {pos, normal, uv: a},
+            None => Self {pos, normal, uv: Vector2::new(0.0, 0.0)},
+        }
     }
 }
 
@@ -612,11 +672,12 @@ impl Vertex {
 #[derive(Copy, Clone, Debug)]
 struct Material {
     albedo: Vec3,
-    _pad0: f32,
+    albedo_texture_index: i32,
     metallic: f32,
     roughness: f32,
     _pad1: [f32; 2],
 }
+
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
@@ -637,9 +698,9 @@ struct Camera {
 }
 
 impl Camera {
-    fn new() -> Self {
+    fn new(position: Point3<f32>) -> Self {
         Self {
-            position: point3(0.0, 0.0, -2.5),
+            position: position,
             yaw: 90.0_f32.to_radians(),
             pitch: 0.0,
             speed: 2.5,
@@ -697,6 +758,22 @@ struct RtAccelerationStructureInstance {
 }
 
 
+struct StagingBuffer<'a> {
+    device: &'a Device,
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+}
+
+impl<'a> Drop for StagingBuffer<'a> {
+    fn drop(&mut self) {
+        unsafe {
+            self.device.destroy_buffer(self.buffer, None);
+            self.device.free_memory(self.memory, None);
+        }
+    }
+}
+
+
 #[repr(C)]
 struct BinHeader {
     magic: [u8; 4],
@@ -704,6 +781,9 @@ struct BinHeader {
     vertex_count: u64,
     index_count: u64,
     material_count: u64,
+    scale: f32,
+    offset: Vec3,
+    index_offset: u32,
 }
 
 
@@ -716,7 +796,70 @@ fn pack_sbt_offset_and_flags(sbt_offset: u32, flags: vk::GeometryInstanceFlagsKH
     (sbt_offset & 0x00FF_FFFF) | ((flags.bits() as u32) << 24)
 }
 
-fn load_obj(path: &str, scale: f32) -> Result<(Vec<Vertex>, Vec<u32>, Vec<u32>, Vec<Material>)> {
+unsafe fn as_bytes<T>(t: &T) -> &[u8] { unsafe {
+    std::slice::from_raw_parts((t as *const T).cast::<u8>(), size_of::<T>())
+}}
+
+unsafe fn as_bytes_mut<T>(t: &mut T) -> &mut [u8] { unsafe {
+    std::slice::from_raw_parts_mut((t as *mut T).cast::<u8>(), size_of::<T>())
+}}
+
+unsafe fn as_slice_bytes<T>(s: &[T]) -> &[u8] { unsafe {
+    std::slice::from_raw_parts(s.as_ptr().cast::<u8>(), s.len() * size_of::<T>())
+}}
+
+fn read_vec<T: Copy>(r: &mut impl Read, count: usize) -> Result<Vec<T>> {
+    let mut v: Vec<T> = Vec::with_capacity(count);
+    unsafe {
+        v.set_len(count);
+        r.read_exact(std::slice::from_raw_parts_mut(
+            v.as_mut_ptr().cast::<u8>(), count * size_of::<T>()
+        ))?;
+    }
+    Ok(v)
+}
+
+
+// Model loading functions
+fn add_model_to_scene(
+    path: &str, scale: f32, position: Vec3,
+    vertices: &mut Vec<Vertex>, indices: &mut Vec<u32>, prim_material_ids: &mut Vec<u32>, materials: &mut Vec<Material>,
+    instance: &Instance, device: &Device, data: &mut AppData,
+) -> Result<()> {
+    let vertex_offset = vertices.len() as u32;
+    let material_offset = materials.len() as u32;
+    
+    let (temp_vertices, temp_indices, temp_prim_material_ids, temp_materials, temp_textures) = load_model(
+        path, scale, position, vertex_offset,
+        instance, device, data
+    )?;
+
+    vertices.extend(&temp_vertices);
+    indices.extend(&temp_indices);
+    prim_material_ids.extend(temp_prim_material_ids.iter().map(|id| id + material_offset));
+    materials.extend(&temp_materials);
+
+    data.textures.extend(&temp_textures);
+
+    Ok(())
+}
+
+fn load_model(
+    path: &str, scale: f32, offset: Vec3, index_offset: u32,
+    instance: &Instance, device: &Device, data: &AppData,
+) -> Result<(Vec<Vertex>, Vec<u32>, Vec<u32>, Vec<Material>, Vec<(vk::Image, vk::DeviceMemory, vk::ImageView)>)> {
+    let ext = Path::new(path).extension().and_then(|e| e.to_str()).unwrap_or("");
+    match ext {
+        "gltf" | "glb" => load_gltf(path, scale, offset, index_offset, instance, device, data),
+        "obj" => {
+            let (v, i, m, mats) = load_obj_cached(path, scale, offset, index_offset)?;
+            Ok((v, i, m, mats, Vec::new()))
+        }
+        other => Err(anyhow!("Unsupported model format: .{}", other)),
+    }
+}
+
+fn load_obj(path: &str, scale: f32, offset: Vec3, index_offset: u32) -> Result<(Vec<Vertex>, Vec<u32>, Vec<u32>, Vec<Material>)> {
     let (models, materials) = tobj::load_obj(
         path,
         &tobj::LoadOptions {
@@ -743,7 +886,7 @@ fn load_obj(path: &str, scale: f32) -> Result<(Vec<Vertex>, Vec<u32>, Vec<u32>, 
         let positions: Vec<Vec3> = mesh
             .positions
             .chunks(3)
-            .map(|p| vec3(p[0] * scale, p[1] * scale, p[2] * scale))
+            .map(|p| vec3(p[0] * scale + offset.x, p[1] * scale + offset.y, p[2] * scale + offset.z))
             .collect();
 
         let normals: Vec<Vec3> = if mesh.normals.is_empty() {
@@ -759,10 +902,10 @@ fn load_obj(path: &str, scale: f32) -> Result<(Vec<Vertex>, Vec<u32>, Vec<u32>, 
             positions
                 .iter()
                 .zip(normals.iter())
-                .map(|(&p, &n)| Vertex::new(p, n)),
+                .map(|(&p, &n)| Vertex::new(p, n, None)),
         );
 
-        indices.extend(mesh.indices.iter().map(|i| i + vertex_offset));
+        indices.extend(mesh.indices.iter().map(|i| i + vertex_offset + index_offset));
     }
 
     Ok((vertices, indices, material_ids, converted_materials))
@@ -798,7 +941,7 @@ fn convert_materials(tobj_materials: &[tobj::Material]) -> Vec<Material> {
             let albedo = m.diffuse.unwrap_or([0.8, 0.8, 0.8]);
             Material {
                 albedo: vec3(albedo[0], albedo[1], albedo[2]),
-                _pad0: 0.0,
+                albedo_texture_index: -1,
                 metallic: m.unknown_param.get("Pm").and_then(|s| s.parse().ok()).unwrap_or(0.0),
                 roughness: m.unknown_param.get("Pr").and_then(|s| s.parse().ok()).unwrap_or(0.5),
                 _pad1: [0.0, 0.0],
@@ -807,28 +950,195 @@ fn convert_materials(tobj_materials: &[tobj::Material]) -> Vec<Material> {
         .collect()
 }
 
+fn load_gltf(
+    path: &str,
+    scale: f32,
+    offset: Vec3,
+    index_offset: u32,
+    instance: &Instance,
+    device: &Device,
+    data: &AppData,
+) -> Result<(Vec<Vertex>, Vec<u32>, Vec<u32>, Vec<Material>, Vec<(vk::Image, vk::DeviceMemory, vk::ImageView)>)> {
+    let (document, buffers, images) = gltf::import(path)?;
+
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+    let mut material_ids = Vec::new();
+
+    for mesh in document.meshes() {
+        for primitive in mesh.primitives() {
+            if primitive.mode() != gltf::mesh::Mode::Triangles {
+                warn!("Skipping non-triangle primitive in mesh {:?}", mesh.name());
+                continue;
+            }
+
+            let reader = primitive.reader(|buffer| Some(&buffers[buffer.index()]));
+
+            let positions: Vec<Vec3> = reader
+                .read_positions()
+                .ok_or_else(|| anyhow!("Primitive missing POSITION attribute"))?
+                .map(|p| vec3(p[0] * scale, p[1] * scale, p[2] * scale))
+                .collect();
+
+            let normals: Vec<Vec3> = match reader.read_normals() {
+                Some(iter) => iter.map(|n| vec3(n[0], n[1], n[2])).collect(),
+                None => {
+                    // fall back to your existing flat-shaded computation
+                    let raw_indices: Vec<u32> = reader
+                        .read_indices()
+                        .map(|i| i.into_u32().collect())
+                        .unwrap_or_else(|| (0..positions.len() as u32).collect());
+                    compute_vertex_normals(&positions, &raw_indices)
+                }
+            };
+
+            let uvs: Vec<Option<cgmath::Vector2<f32>>> = match reader.read_tex_coords(0) {
+                Some(read_tex_coords) => read_tex_coords
+                    .into_f32()
+                    .map(|uv| Some(cgmath::vec2(uv[0], uv[1])))
+                    .collect(),
+                None => vec![None; positions.len()],
+            };
+
+            let vertex_offset = vertices.len() as u32;
+            vertices.extend(
+                positions.iter()
+                    .zip(normals.iter())
+                    .zip(uvs.iter())
+                    .map(|((&p, &n), &uv)| Vertex::new(p + offset, n, uv)),
+            );
+
+            let prim_indices: Vec<u32> = match reader.read_indices() {
+                Some(iter) => iter.into_u32().map(|i| i + vertex_offset + index_offset).collect(),
+                None => (0..positions.len() as u32).map(|i| i + vertex_offset + index_offset).collect(),
+            };
+
+            let mat_id = primitive.material().index().unwrap_or(0) as u32;
+            let triangle_count = prim_indices.len() / 3;
+            material_ids.extend(std::iter::repeat(mat_id).take(triangle_count));
+
+            indices.extend(prim_indices);
+        }
+    }
+
+    let textures = unsafe {
+        create_gltf_textures(instance, device, data, &images)?
+    };
+    let materials = convert_gltf_materials(&document);
+
+    Ok((vertices, indices, material_ids, materials, textures))
+}
+
+fn convert_gltf_materials(document: &gltf::Document) -> Vec<Material> {
+    document
+        .materials()
+        .map(|m| {
+            let pbr = m.pbr_metallic_roughness();
+            let base_color = pbr.base_color_factor();
+
+            let albedo_texture_index = pbr
+                .base_color_texture()
+                .map(|info| info.texture().source().index() as i32)
+                .unwrap_or(-1);
+
+            Material {
+                albedo: vec3(base_color[0], base_color[1], base_color[2]),
+                albedo_texture_index,
+                metallic: pbr.metallic_factor(),
+                roughness: pbr.roughness_factor(),
+                _pad1: [0.0, 0.0],
+            }
+        })
+        .collect()
+}
+
+unsafe fn create_gltf_textures(
+    instance: &Instance,
+    device: &Device,
+    data: &AppData,
+    images: &[gltf::image::Data],
+) -> Result<Vec<(vk::Image, vk::DeviceMemory, vk::ImageView)>> { unsafe {
+    let mut textures = Vec::new();
+
+    for img in images {
+        let (vk_format, _bpp) = gltf_to_vulkan(img.format)
+            .ok_or_else(|| anyhow!("Unsupported glTF image format: {:?}", img.format))?;
+
+        let pixels: Vec<u8> = match img.format {
+            gltf::image::Format::R8G8B8A8 => img.pixels.clone(),
+            gltf::image::Format::R8G8B8 => img.pixels
+                .chunks(3)
+                .flat_map(|rgb| [rgb[0], rgb[1], rgb[2], 255u8])
+                .collect(),
+            gltf::image::Format::R16G16B16A16 => img.pixels.clone(),
+            gltf::image::Format::R16G16B16 => {
+                let u16_pixels: &[u16] = bytemuck::cast_slice(&img.pixels);
+                u16_pixels
+                    .chunks(3)
+                    .flat_map(|rgb| [rgb[0], rgb[1], rgb[2], u16::MAX])
+                    .collect::<Vec<u16>>()
+                    .into_iter()
+                    .flat_map(|v| v.to_ne_bytes())
+                    .collect()
+            }
+            other => return Err(anyhow!("Unsupported glTF image format: {:?}", other)),
+        };
+
+        let (image, memory, view) = create_texture_image(
+            instance, device, data,
+            data.command_pool, data.graphics_queue,
+            &pixels, img.width, img.height, vk_format,
+        )?;
+
+        textures.push((image, memory, view));
+    }
+
+    Ok(textures)
+}}
+
+fn gltf_to_vulkan(format: gltf::image::Format) -> Option<(vk::Format, u32)> {
+    match format {
+        R8G8B8A8 => Some((vk::Format::R8G8B8A8_SRGB, 4)),
+        R8G8B8 => Some((vk::Format::R8G8B8A8_SRGB, 4)),
+        R16G16B16A16 => Some((vk::Format::R16G16B16A16_UNORM, 8)),
+        R16G16B16 => Some((vk::Format::R16G16B16A16_UNORM, 8)),
+        _ => None,
+    }
+}
+
+
+// Model caching functions
 fn cache_path(obj_path: &str) -> String {
     format!("models/binaries/{}.bin", 
         Path::new(obj_path).file_stem().unwrap().to_str().unwrap())
 }
 
-fn load_obj_cached(path: &str, scale: f32) -> Result<(Vec<Vertex>, Vec<u32>, Vec<u32>, Vec<Material>)> {
+fn load_obj_cached(path: &str, scale: f32, offset: Vec3, index_offset: u32) -> Result<(Vec<Vertex>, Vec<u32>, Vec<u32>, Vec<Material>)> {
     let bin_path = cache_path(path);
 
     if Path::new(&bin_path).exists() {
         info!("Loading cached binary: {}", bin_path);
-        return load_binary(&bin_path);
+        match load_binary(&bin_path, scale, offset, index_offset) {
+            Ok(result) => {
+                info!("Loaded cached binary: {}", bin_path);
+                return Ok(result);
+            }
+            Err(e) => {
+                warn!("Cache at {} invalid ({}), deleting and reparsing", bin_path, e);
+                std::fs::remove_file(&bin_path)?;
+            }
+        }
     }
 
     info!("No cache found, parsing OBJ (this may take a while)...");
-    let result = load_obj(path, scale)?;
-    save_binary(&bin_path, &result)?;
+    let result = load_obj(path, scale, offset, index_offset)?;
+    save_binary(&bin_path, scale, offset, index_offset, &result)?;
     Ok(result)
 }
 
 fn save_binary(
-    path: &str, 
-    data: &(Vec<Vertex>, Vec<u32>, Vec<u32>, Vec<Material>)
+    path: &str, scale: f32, offset: Vec3, index_offset: u32,
+    data: &(Vec<Vertex>, Vec<u32>, Vec<u32>, Vec<Material>),
 ) -> Result<()> {
     std::fs::create_dir_all("models/binaries")?;
     let (vertices, indices, material_ids, materials) = data;
@@ -840,6 +1150,9 @@ fn save_binary(
         vertex_count: vertices.len() as u64,
         index_count: indices.len() as u64,
         material_count: materials.len() as u64,
+        scale,
+        offset,
+        index_offset,
     };
 
     unsafe {
@@ -852,17 +1165,27 @@ fn save_binary(
     Ok(())
 }
 
-fn load_binary(path: &str) -> Result<(Vec<Vertex>, Vec<u32>, Vec<u32>, Vec<Material>)> {
+fn load_binary(path: &str, scale: f32, offset: Vec3, index_offset: u32) -> Result<(Vec<Vertex>, Vec<u32>, Vec<u32>, Vec<Material>)> {
     let mut r = BufReader::new(File::open(path)?);
 
     let mut header = BinHeader { 
         magic: [0;4], version: 0, 
-        vertex_count: 0, index_count: 0, material_count: 0 
+        vertex_count: 0, index_count: 0, material_count: 0 ,
+        scale: 1.0, offset: Vec3::new(0.0, 0.0, 0.0), index_offset: 0,
     };
     unsafe {r.read_exact(as_bytes_mut(&mut header))?;}
     
     if &header.magic != b"VKRT" {
         return Err(anyhow!("Bad cache file magic, deleting and reparsing"));
+    }
+    if header.scale != scale {
+        return Err(anyhow!("Mismatched scale, deleting and reparsing"));
+    }
+    if header.offset != offset {
+        return Err(anyhow!("Mismatched offset, deleting and reparsing"));
+    }
+    if header.index_offset != index_offset {
+        return Err(anyhow!("Mismatched index offset, deleting and reparsing"));
     }
     if header.version != 1 {
         return Err(anyhow!("Cache version mismatch"));
@@ -874,29 +1197,6 @@ fn load_binary(path: &str) -> Result<(Vec<Vertex>, Vec<u32>, Vec<u32>, Vec<Mater
     let materials = read_vec::<Material>(&mut r, header.material_count as usize)?;
 
     Ok((vertices, indices, material_ids, materials))
-}
-
-unsafe fn as_bytes<T>(t: &T) -> &[u8] { unsafe {
-    std::slice::from_raw_parts((t as *const T).cast::<u8>(), size_of::<T>())
-}}
-
-unsafe fn as_bytes_mut<T>(t: &mut T) -> &mut [u8] { unsafe {
-    std::slice::from_raw_parts_mut((t as *mut T).cast::<u8>(), size_of::<T>())
-}}
-
-unsafe fn as_slice_bytes<T>(s: &[T]) -> &[u8] { unsafe {
-    std::slice::from_raw_parts(s.as_ptr().cast::<u8>(), s.len() * size_of::<T>())
-}}
-
-fn read_vec<T: Copy>(r: &mut impl Read, count: usize) -> Result<Vec<T>> {
-    let mut v: Vec<T> = Vec::with_capacity(count);
-    unsafe {
-        v.set_len(count);
-        r.read_exact(std::slice::from_raw_parts_mut(
-            v.as_mut_ptr().cast::<u8>(), count * size_of::<T>()
-        ))?;
-    }
-    Ok(v)
 }
 
 
@@ -1013,6 +1313,7 @@ unsafe fn create_instance(
     Ok(instance)
 }}
 
+
 // Device checking
 unsafe fn check_physical_device(
     instance: &Instance,
@@ -1056,12 +1357,14 @@ unsafe fn check_physical_device_rt_features(
     let mut accel_struct_features = vk::PhysicalDeviceAccelerationStructureFeaturesKHR::builder();
     let mut bda_features = vk::PhysicalDeviceBufferDeviceAddressFeatures::builder();
     let mut scalar_block_layout_features = vk::PhysicalDeviceScalarBlockLayoutFeatures::builder();
+    let mut descriptor_indexing_features = vk::PhysicalDeviceDescriptorIndexingFeatures::builder();
 
     let mut features2 = vk::PhysicalDeviceFeatures2::builder()
         .push_next(&mut rt_pipeline_features)
         .push_next(&mut accel_struct_features)
         .push_next(&mut bda_features)
-        .push_next(&mut scalar_block_layout_features);
+        .push_next(&mut scalar_block_layout_features)
+        .push_next(&mut descriptor_indexing_features);
 
     instance.get_physical_device_features2(physical_device, &mut features2);
 
@@ -1152,6 +1455,10 @@ unsafe fn create_logical_device(
     let mut scalar_block_layout_features = vk::PhysicalDeviceScalarBlockLayoutFeatures::builder()
         .scalar_block_layout(true);
     
+    let mut descriptor_indexing_features = vk::PhysicalDeviceDescriptorIndexingFeatures::builder()
+        .shader_sampled_image_array_non_uniform_indexing(true)
+        .runtime_descriptor_array(true);
+
     let base_features = vk::PhysicalDeviceFeatures::builder()
         .shader_int64(true);
     
@@ -1161,7 +1468,8 @@ unsafe fn create_logical_device(
         .push_next(&mut accel_struct_features)
         .push_next(&mut bda_features)
         .push_next(&mut dynamic_rendering_features)
-        .push_next(&mut scalar_block_layout_features);
+        .push_next(&mut scalar_block_layout_features)
+        .push_next(&mut descriptor_indexing_features);
 
     instance.get_physical_device_features2(data.physical_device, &mut features2);
 
@@ -1293,6 +1601,7 @@ unsafe fn create_shader_module(
 }}
 
 
+// Command buffer functions
 unsafe fn create_command_pool(
     instance: &Instance,
     device: &Device,
@@ -1589,6 +1898,149 @@ unsafe fn create_storage_image(
 }}
 
 
+// Texture functions
+unsafe fn create_texture_image(
+    instance: &Instance,
+    device: &Device,
+    data: &AppData,
+    command_pool: vk::CommandPool,
+    queue: vk::Queue,
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    format: vk::Format,
+) -> Result<(vk::Image, vk::DeviceMemory, vk::ImageView)> { unsafe {
+    let size = pixels.len() as u64;
+
+    // Staging buffer
+    let (staging_buffer_raw, staging_memory) = create_buffer(
+        instance, device, data, size,
+        vk::BufferUsageFlags::TRANSFER_SRC,
+        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+    )?;
+    let staging = StagingBuffer {device, buffer: staging_buffer_raw, memory: staging_memory};
+
+    let mem = device.map_memory(staging_memory, 0, size, vk::MemoryMapFlags::empty())?;
+    
+    memcpy(pixels.as_ptr(), mem.cast::<u8>(), size as usize);
+    device.unmap_memory(staging_memory);
+
+    // Device local image
+    let image_info = vk::ImageCreateInfo::builder()
+        .image_type(vk::ImageType::_2D)
+        .format(format) // sRGB — matches glTF's baseColor color space
+        .extent(vk::Extent3D { width, height, depth: 1 })
+        .mip_levels(1) // no mipmaps yet — fine for now, add later if aliasing shows up
+        .array_layers(1)
+        .samples(vk::SampleCountFlags::_1)
+        .tiling(vk::ImageTiling::OPTIMAL)
+        .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE)
+        .initial_layout(vk::ImageLayout::UNDEFINED);
+
+    let image = device.create_image(&image_info, None)?;
+    let requirements = device.get_image_memory_requirements(image);
+
+    let memory_info = vk::MemoryAllocateInfo::builder()
+        .allocation_size(requirements.size)
+        .memory_type_index(get_memory_type_index(
+            instance, data, vk::MemoryPropertyFlags::DEVICE_LOCAL, requirements,
+        )?);
+
+    let memory = device.allocate_memory(&memory_info, None)?;
+    device.bind_image_memory(image, memory, 0)?;
+
+
+    let alloc_info = vk::CommandBufferAllocateInfo::builder()
+        .level(vk::CommandBufferLevel::PRIMARY)
+        .command_pool(command_pool)
+        .command_buffer_count(1);
+    let cmd = device.allocate_command_buffers(&alloc_info)?[0];
+    device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::builder()
+        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
+
+    let subresource = vk::ImageSubresourceRange::builder()
+        .aspect_mask(vk::ImageAspectFlags::COLOR)
+        .level_count(1)
+        .layer_count(1)
+        .build();
+
+    let to_transfer_barrier = vk::ImageMemoryBarrier::builder()
+        .old_layout(vk::ImageLayout::UNDEFINED)
+        .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .image(image)
+        .subresource_range(subresource)
+        .src_access_mask(vk::AccessFlags::empty())
+        .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
+
+    device.cmd_pipeline_barrier(
+        cmd, vk::PipelineStageFlags::TOP_OF_PIPE, vk::PipelineStageFlags::TRANSFER,
+        vk::DependencyFlags::empty(), &[] as &[vk::MemoryBarrier], &[] as &[vk::BufferMemoryBarrier],
+        &[to_transfer_barrier],
+    );
+
+    let region = vk::BufferImageCopy::builder()
+        .buffer_offset(0)
+        .buffer_row_length(0)
+        .buffer_image_height(0)
+        .image_subresource(vk::ImageSubresourceLayers::builder()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .mip_level(0).base_array_layer(0).layer_count(1).build())
+        .image_extent(vk::Extent3D { width, height, depth: 1 });
+
+    device.cmd_copy_buffer_to_image(
+        cmd, staging.buffer, image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[region],
+    );
+
+    let to_shader_read_barrier = vk::ImageMemoryBarrier::builder()
+        .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+        .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .image(image)
+        .subresource_range(subresource)
+        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+        .dst_access_mask(vk::AccessFlags::SHADER_READ);
+
+    device.cmd_pipeline_barrier(
+        cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::RAY_TRACING_SHADER_KHR,
+        vk::DependencyFlags::empty(), &[] as &[vk::MemoryBarrier], &[] as &[vk::BufferMemoryBarrier],
+        &[to_shader_read_barrier],
+    );
+
+    device.end_command_buffer(cmd)?;
+    device.queue_submit(queue, &[vk::SubmitInfo::builder().command_buffers(&[cmd])], vk::Fence::null())?;
+    device.queue_wait_idle(queue)?;
+    device.free_command_buffers(command_pool, &[cmd]);
+
+    let view_info = vk::ImageViewCreateInfo::builder()
+        .image(image)
+        .view_type(vk::ImageViewType::_2D)
+        .format(format)
+        .subresource_range(subresource);
+    let view = device.create_image_view(&view_info, None)?;
+
+    Ok((image, memory, view))
+}}
+
+unsafe fn create_texture_sampler(device: &Device) -> Result<vk::Sampler> { unsafe {
+    let info = vk::SamplerCreateInfo::builder()
+        .mag_filter(vk::Filter::LINEAR)
+        .min_filter(vk::Filter::LINEAR)
+        .address_mode_u(vk::SamplerAddressMode::REPEAT)
+        .address_mode_v(vk::SamplerAddressMode::REPEAT)
+        .address_mode_w(vk::SamplerAddressMode::REPEAT)
+        .anisotropy_enable(false)
+        .border_color(vk::BorderColor::INT_OPAQUE_BLACK)
+        .unnormalized_coordinates(false)
+        .compare_enable(false)
+        .mipmap_mode(vk::SamplerMipmapMode::LINEAR);
+    Ok(device.create_sampler(&info, None)?)
+}}
+
+
 unsafe fn create_sync_objects(device: &Device, data: &mut AppData) -> Result<()> { unsafe {
     let semaphore_info = vk::SemaphoreCreateInfo::builder();
     let fence_info = vk::FenceCreateInfo::builder()
@@ -1610,6 +2062,7 @@ unsafe fn create_sync_objects(device: &Device, data: &mut AppData) -> Result<()>
 
     Ok(())
 }}
+
 
 // Buffer utils
 unsafe fn create_buffer(
@@ -1772,6 +2225,7 @@ unsafe fn get_memory_type_index(
 }}
 
 
+// Acceleration struct creation
 unsafe fn create_blas(
     instance: &Instance,
     device: &Device,
@@ -2086,6 +2540,7 @@ unsafe fn create_tlas(
 }}
 
 
+// Pipeline creation
 unsafe fn create_rt_pipeline(
     device: &Device,
     data: &mut AppData,
@@ -2305,6 +2760,7 @@ unsafe fn create_shader_binding_table(
 }}
 
 
+// Descriptor creation
 unsafe fn create_descriptor_set_layout(
     device: &Device,
     data: &mut AppData,
@@ -2349,14 +2805,18 @@ unsafe fn create_descriptor_set_layout(
         .descriptor_count(1)
         .stage_flags(rt_stages);
 
+    let textures_binding = vk::DescriptorSetLayoutBinding::builder()
+        .binding(6)
+        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+        .descriptor_count(data.textures.len().max(1) as u32) // array size!
+        .stage_flags(rt_stages);
+
 
     let bindings = &[
-        as_binding,
-        image_binding,
-        ubo_binding,
-        object_descs_binding,
-        materials_binding,
-        material_ids_binding,
+        as_binding, image_binding,
+        ubo_binding, 
+        object_descs_binding, materials_binding, material_ids_binding,
+        textures_binding,
     ];
 
     let info = vk::DescriptorSetLayoutCreateInfo::builder()
@@ -2392,7 +2852,16 @@ unsafe fn create_descriptor_pool(device: &Device, data: &mut AppData) -> Result<
         .type_(vk::DescriptorType::STORAGE_BUFFER)
         .descriptor_count((data.swapchain_images.len() * 3) as u32);
 
-    let pool_sizes = &[as_size, image_size, ubo_size, object_descs_size, materials_size, storage_buffer_size];
+    let textures_size = vk::DescriptorPoolSize::builder()
+    .type_(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+    .descriptor_count((data.swapchain_images.len() * data.textures.len().max(1)) as u32);
+
+
+    let pool_sizes = &[
+        as_size, image_size, ubo_size, object_descs_size, materials_size, 
+        storage_buffer_size, textures_size,
+    ];
+
     let info = vk::DescriptorPoolCreateInfo::builder()
         .pool_sizes(pool_sizes)
         .max_sets(data.swapchain_images.len() as u32);
@@ -2409,10 +2878,23 @@ unsafe fn create_descriptor_sets(device: &Device, data: &mut AppData) -> Result<
         .descriptor_pool(data.descriptor_pool)
         .set_layouts(&layouts);
 
+    let texture_infos: Vec<vk::DescriptorImageInfo> = data.textures
+        .iter()
+        .map(|(_, _, view)| {
+            vk::DescriptorImageInfo::builder()
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .image_view(*view)
+                .sampler(data.texture_sampler)
+                .build()
+        })
+        .collect();
+
     data.descriptor_sets = device.allocate_descriptor_sets(&info)?;
 
     for i in 0..data.swapchain_images.len() {
-        // Build acceleration structure info
+        let mut writes = Vec::new();
+
+        // Acceleration structure write
         let mut as_write_info = vk::WriteDescriptorSetAccelerationStructureKHR::builder()
             .acceleration_structures(std::slice::from_ref(&data.tlas))
             .build();
@@ -2425,6 +2907,8 @@ unsafe fn create_descriptor_sets(device: &Device, data: &mut AppData) -> Result<
             .descriptor_type(vk::DescriptorType::ACCELERATION_STRUCTURE_KHR)
             .build();
         as_write.descriptor_count = 1;
+        writes.push(as_write);
+
 
         // Image write
         let image_info = vk::DescriptorImageInfo::builder()
@@ -2439,6 +2923,8 @@ unsafe fn create_descriptor_sets(device: &Device, data: &mut AppData) -> Result<
             .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
             .image_info(std::slice::from_ref(&image_info))
             .build();
+        writes.push(image_write);
+
 
         // UBO write
         let buffer_info = vk::DescriptorBufferInfo::builder()
@@ -2454,8 +2940,10 @@ unsafe fn create_descriptor_sets(device: &Device, data: &mut AppData) -> Result<
             .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
             .buffer_info(std::slice::from_ref(&buffer_info))
             .build();
+        writes.push(ubo_write);
 
-        // Material write
+
+        // Object descriptions write
         let object_descs_info = vk::DescriptorBufferInfo::builder()
             .buffer(data.object_descs_buffer)
             .offset(0)
@@ -2469,7 +2957,10 @@ unsafe fn create_descriptor_sets(device: &Device, data: &mut AppData) -> Result<
             .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
             .buffer_info(std::slice::from_ref(&object_descs_info))
             .build();
+        writes.push(object_descs_write);
 
+
+        // Materials write
         let materials_info = vk::DescriptorBufferInfo::builder()
             .buffer(data.materials_buffer)
             .offset(0)
@@ -2483,7 +2974,10 @@ unsafe fn create_descriptor_sets(device: &Device, data: &mut AppData) -> Result<
             .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
             .buffer_info(std::slice::from_ref(&materials_info))
             .build();
+        writes.push(materials_write);
 
+
+        // Material id write
         let material_ids_info = vk::DescriptorBufferInfo::builder()
             .buffer(data.material_ids_buffer)
             .offset(0)
@@ -2497,10 +2991,24 @@ unsafe fn create_descriptor_sets(device: &Device, data: &mut AppData) -> Result<
             .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
             .buffer_info(std::slice::from_ref(&material_ids_info))
             .build();
+        writes.push(material_ids_write);
+
+
+        // Texture write
+        if !texture_infos.is_empty() {
+            let textures_write = vk::WriteDescriptorSet::builder()
+                .dst_set(data.descriptor_sets[i])
+                .dst_binding(6)
+                .dst_array_element(0)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&texture_infos)
+                .build();
+            writes.push(textures_write)
+        }
 
 
         device.update_descriptor_sets(
-            &[as_write, image_write, ubo_write, object_descs_write, materials_write, material_ids_write],
+            &writes,
             &[] as &[vk::CopyDescriptorSet],
         );
     }
