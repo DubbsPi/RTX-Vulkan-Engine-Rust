@@ -1,9 +1,19 @@
 #version 460
-#extension GL_EXT_ray_tracing : require
+#extension GL_GOOGLE_include_directive : require
+
+#include "common.glsl"
+
 
 layout(location = 0) rayPayloadInEXT vec3 hitColor;
 
+
+layout(binding = 2, set = 0) uniform CameraUBO {
+    mat4 viewInverse;
+    mat4 projInverse;
+    float time;
+} cam;
+
+
 void main() {
-    float t = gl_WorldRayDirectionEXT.y * 0.5 + 0.5;
-    hitColor = vec3(0, 0, t);
+    hitColor = getSky(gl_WorldRayDirectionEXT, sunLightDir, cam.viewInverse[3].y);
 }
