@@ -3,8 +3,14 @@
 
 #include "common.glsl"
 
+#extension GL_GOOGLE_include_directive : require
+
+#include "common.glsl"
+
 
 layout(location = 0) rayPayloadInEXT vec3 hitColor;
+layout(location = 1) rayPayloadEXT bool shadowed;
+
 layout(location = 1) rayPayloadEXT bool shadowed;
 
 hitAttributeEXT vec2 attribs;
