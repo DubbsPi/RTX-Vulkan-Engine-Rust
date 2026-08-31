@@ -8,7 +8,7 @@
 #extension GL_EXT_nonuniform_qualifier : require
 
 
-const vec3 sunLightDir = normalize(vec3(-1, 0.1, 0.5));
+const vec3 sunLightDir = normalize(vec3(-0.4, 1, 0.2));
 
 #define SKY_VIEW_SAMPLES 12
 #define SKY_LIGHT_SAMPLES 6

@@ -21,25 +21,25 @@ use std::os::raw::c_void;
 use std::time::{Duration, Instant};
 use std::mem::size_of;
 use std::ptr::copy_nonoverlapping as memcpy;
-use std::io::{Read, Write, BufReader, BufWriter};
-use std::fs::File;
-use std::path::Path;
 
 use winit::window::{Window, WindowBuilder};
 use winit::event::{Event, WindowEvent};
 use winit::event_loop::EventLoop;
 
-use cgmath::{Deg, Point3, Vector2, vec3};
+use cgmath::{Deg, Point3, vec3};
 use cgmath::SquareMatrix;
 use cgmath::InnerSpace;
-use cgmath::Zero;
 
 use gltf::image::Format::*;
 
+mod common;
+use common::Vertex;
+use common::Material;
+use common::Vec3;
+use common::Mat4;
 
-type Vec2 = cgmath::Vector2<f32>;
-type Vec3 = cgmath::Vector3<f32>;
-type Mat4 = cgmath::Matrix4<f32>;
+mod scene;
+use scene::Scene;
 
 
 const PORTABILITY_MACOS_VERSION: Version = Version::new(1, 3, 216);
@@ -177,53 +177,37 @@ impl App {
         create_storage_image(&instance, &device, &mut data)?;
 
 
-        let mut vertices = Vec::new();
-        let mut indices = Vec::new();
-        let mut prim_material_ids = Vec::new();
-        let mut materials = Vec::new();
-
-        // Truck
-        add_model_to_scene(
-            "models/gmc-sierra-hd2500/source/gmc.glb", 1.0, Vec3::new(0.0, 1.0, 5.0),
-            &mut vertices, &mut indices, &mut prim_material_ids, &mut materials,
-            &instance, &device, &mut data
-        )?;
-
-        add_model_to_scene(
-            "models/plant.obj", 1.0, Vec3::new(0.0, 1.75, 2.5),
-            &mut vertices, &mut indices, &mut prim_material_ids, &mut materials,
-            &instance, &device, &mut data
-        )?;
-
-
-        // Ground plane
-        let ground_vertex_offset = vertices.len() as u32;
-        let ground_size = 25.0;
-        let ground_y = 0.0;
-
-        vertices.extend([
-            Vertex::new(vec3(-ground_size, ground_y, -ground_size), vec3(0.0, 1.0, 0.0), None),
-            Vertex::new(vec3(ground_size, ground_y, -ground_size), vec3(0.0, 1.0, 0.0), None),
-            Vertex::new(vec3(ground_size, ground_y, ground_size), vec3(0.0, 1.0, 0.0), None),
-            Vertex::new(vec3(-ground_size, ground_y, ground_size), vec3(0.0, 1.0, 0.0), None),
-        ]);
-
-        indices.extend([
-            ground_vertex_offset, ground_vertex_offset + 1, ground_vertex_offset + 2,
-            ground_vertex_offset, ground_vertex_offset + 2, ground_vertex_offset + 3,
-        ]);
+        let mut scene = Scene::new();
         
+        let truck = Scene::load_model_into_memory(
+            "models/gmc-sierra-hd2500/source/gmc.glb",
+            &instance, &device, &mut data,
+        )?;
+        scene.add_model_to_scene(&truck);
+        scene.add_model_to_scene(&truck);
+
+        scene.scale_model(0, vec3(2.0, 0.5, 1.0));
+        scene.move_model(0, vec3(3.0, -2.0, 0.0));
+
+        let novabeast = Scene::load_model_into_memory(
+            "models/Novabeast_V1_2.glb",
+            &instance, &device, &mut data,
+        )?;
+        scene.add_model_to_scene(&novabeast);
+        
+        scene.move_model(2, vec3(0.0, 1.0, 0.0));
+
         
         data.texture_sampler = create_texture_sampler(&device)?;
-        info!("Triangles: {}, Vertices: {}", indices.len() / 3, vertices.len());
+        info!("Triangles: {}, Vertices: {}", scene.indices.len() / 3, scene.vertices.len());
 
         create_descriptor_set_layout(&device, &mut data)?;
         create_rt_pipeline(&device, &mut data)?;
 
-        create_blas(&instance, &device, &mut data, &vertices, &indices)?;
+        create_blas(&instance, &device, &mut data, &scene.vertices, &scene.indices)?;
         create_tlas(&instance, &device, &mut data)?;
 
-        create_scene_buffers(&instance, &device, &mut data, &materials, &prim_material_ids)?;
+        create_scene_buffers(&instance, &device, &mut data, &scene.materials, &scene.material_ids)?;
 
         create_uniform_buffers(&instance, &device, &mut data)?;
         create_descriptor_pool(&device, &mut data)?;
@@ -652,35 +636,6 @@ pub struct SuitabilityError(pub &'static str);
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
-struct Vertex {
-    pos: Vec3,
-    normal: Vec3,
-    uv: Vec2,
-}
-
-impl Vertex {
-    const fn new(pos: Vec3, normal: Vec3, uv: Option<Vec2>) -> Self {
-        match uv {
-            Some(a) => Self {pos, normal, uv: a},
-            None => Self {pos, normal, uv: Vector2::new(0.0, 0.0)},
-        }
-    }
-}
-
-
-#[repr(C)]
-#[derive(Copy, Clone, Debug)]
-struct Material {
-    albedo: Vec3,
-    albedo_texture_index: i32,
-    metallic: f32,
-    roughness: f32,
-    _pad1: [f32; 2],
-}
-
-
-#[repr(C)]
-#[derive(Copy, Clone, Debug)]
 struct ObjectDesc {
     vertex_address: u64,
     index_address: u64,
@@ -774,19 +729,6 @@ impl<'a> Drop for StagingBuffer<'a> {
 }
 
 
-#[repr(C)]
-struct BinHeader {
-    magic: [u8; 4],
-    version: u32,
-    vertex_count: u64,
-    index_count: u64,
-    material_count: u64,
-    scale: f32,
-    offset: Vec3,
-    index_offset: u32,
-}
-
-
 // Utility functions
 fn pack_custom_index_and_mask(custom_index: u32, mask: u8) -> u32 {
     (custom_index & 0x00FF_FFFF) | ((mask as u32) << 24)
@@ -795,410 +737,6 @@ fn pack_custom_index_and_mask(custom_index: u32, mask: u8) -> u32 {
 fn pack_sbt_offset_and_flags(sbt_offset: u32, flags: vk::GeometryInstanceFlagsKHR) -> u32 {
     (sbt_offset & 0x00FF_FFFF) | ((flags.bits() as u32) << 24)
 }
-
-unsafe fn as_bytes<T>(t: &T) -> &[u8] { unsafe {
-    std::slice::from_raw_parts((t as *const T).cast::<u8>(), size_of::<T>())
-}}
-
-unsafe fn as_bytes_mut<T>(t: &mut T) -> &mut [u8] { unsafe {
-    std::slice::from_raw_parts_mut((t as *mut T).cast::<u8>(), size_of::<T>())
-}}
-
-unsafe fn as_slice_bytes<T>(s: &[T]) -> &[u8] { unsafe {
-    std::slice::from_raw_parts(s.as_ptr().cast::<u8>(), s.len() * size_of::<T>())
-}}
-
-fn read_vec<T: Copy>(r: &mut impl Read, count: usize) -> Result<Vec<T>> {
-    let mut v: Vec<T> = Vec::with_capacity(count);
-    unsafe {
-        v.set_len(count);
-        r.read_exact(std::slice::from_raw_parts_mut(
-            v.as_mut_ptr().cast::<u8>(), count * size_of::<T>()
-        ))?;
-    }
-    Ok(v)
-}
-
-
-// Model loading functions
-fn add_model_to_scene(
-    path: &str, scale: f32, position: Vec3,
-    vertices: &mut Vec<Vertex>, indices: &mut Vec<u32>, prim_material_ids: &mut Vec<u32>, materials: &mut Vec<Material>,
-    instance: &Instance, device: &Device, data: &mut AppData,
-) -> Result<()> {
-    let vertex_offset = vertices.len() as u32;
-    let material_offset = materials.len() as u32;
-    
-    let (temp_vertices, temp_indices, temp_prim_material_ids, temp_materials, temp_textures) = load_model(
-        path, scale, position, vertex_offset,
-        instance, device, data
-    )?;
-
-    vertices.extend(&temp_vertices);
-    indices.extend(&temp_indices);
-    prim_material_ids.extend(temp_prim_material_ids.iter().map(|id| id + material_offset));
-    materials.extend(&temp_materials);
-
-    data.textures.extend(&temp_textures);
-
-    Ok(())
-}
-
-fn load_model(
-    path: &str, scale: f32, offset: Vec3, index_offset: u32,
-    instance: &Instance, device: &Device, data: &AppData,
-) -> Result<(Vec<Vertex>, Vec<u32>, Vec<u32>, Vec<Material>, Vec<(vk::Image, vk::DeviceMemory, vk::ImageView)>)> {
-    let ext = Path::new(path).extension().and_then(|e| e.to_str()).unwrap_or("");
-    match ext {
-        "gltf" | "glb" => load_gltf(path, scale, offset, index_offset, instance, device, data),
-        "obj" => {
-            let (v, i, m, mats) = load_obj_cached(path, scale, offset, index_offset)?;
-            Ok((v, i, m, mats, Vec::new()))
-        }
-        other => Err(anyhow!("Unsupported model format: .{}", other)),
-    }
-}
-
-fn load_obj(path: &str, scale: f32, offset: Vec3, index_offset: u32) -> Result<(Vec<Vertex>, Vec<u32>, Vec<u32>, Vec<Material>)> {
-    let (models, materials) = tobj::load_obj(
-        path,
-        &tobj::LoadOptions {
-            triangulate: true,
-            single_index: true,
-            ..Default::default()
-        },
-    )?;
-
-    let converted_materials = convert_materials(&materials.unwrap_or_default());
-    let mut vertices = Vec::new();
-    let mut indices = Vec::new();
-    let mut material_ids = Vec::new();
-
-    for model in &models {
-        let mesh = &model.mesh;
-        let vertex_offset = vertices.len() as u32;
-
-        let triangle_count = mesh.indices.len() / 3;
-        let mat_id = mesh.material_id.unwrap_or(0) as u32;
-
-        material_ids.extend(std::iter::repeat(mat_id).take(triangle_count));
-
-        let positions: Vec<Vec3> = mesh
-            .positions
-            .chunks(3)
-            .map(|p| vec3(p[0] * scale + offset.x, p[1] * scale + offset.y, p[2] * scale + offset.z))
-            .collect();
-
-        let normals: Vec<Vec3> = if mesh.normals.is_empty() {
-            compute_vertex_normals(&positions, &mesh.indices)
-        } else {
-            mesh.normals
-                .chunks(3)
-                .map(|n| vec3(n[0], n[1], n[2]))
-                .collect()
-        };
-
-        vertices.extend(
-            positions
-                .iter()
-                .zip(normals.iter())
-                .map(|(&p, &n)| Vertex::new(p, n, None)),
-        );
-
-        indices.extend(mesh.indices.iter().map(|i| i + vertex_offset + index_offset));
-    }
-
-    Ok((vertices, indices, material_ids, converted_materials))
-}
-
-fn compute_vertex_normals(positions: &[Vec3], indices: &[u32]) -> Vec<Vec3> {
-    let mut normals = vec![Vec3::zero(); positions.len()];
-
-    for tri in indices.chunks(3) {
-        let (i0, i1, i2) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
-        let (v0, v1, v2) = (positions[i0], positions[i1], positions[i2]);
-
-        let face_normal = (v1 - v0).cross(v2 - v0);
-
-        normals[i0] += face_normal;
-        normals[i1] += face_normal;
-        normals[i2] += face_normal;
-    }
-
-    for n in &mut normals {
-        if n.x * n.x + n.y * n.y + n.z * n.z > 0.0 {
-            *n = n.normalize();
-        }
-    }
-
-    normals
-}
-
-fn convert_materials(tobj_materials: &[tobj::Material]) -> Vec<Material> {
-    tobj_materials
-        .iter()
-        .map(|m| {
-            let albedo = m.diffuse.unwrap_or([0.8, 0.8, 0.8]);
-            Material {
-                albedo: vec3(albedo[0], albedo[1], albedo[2]),
-                albedo_texture_index: -1,
-                metallic: m.unknown_param.get("Pm").and_then(|s| s.parse().ok()).unwrap_or(0.0),
-                roughness: m.unknown_param.get("Pr").and_then(|s| s.parse().ok()).unwrap_or(0.5),
-                _pad1: [0.0, 0.0],
-            }
-        })
-        .collect()
-}
-
-fn load_gltf(
-    path: &str,
-    scale: f32,
-    offset: Vec3,
-    index_offset: u32,
-    instance: &Instance,
-    device: &Device,
-    data: &AppData,
-) -> Result<(Vec<Vertex>, Vec<u32>, Vec<u32>, Vec<Material>, Vec<(vk::Image, vk::DeviceMemory, vk::ImageView)>)> {
-    let (document, buffers, images) = gltf::import(path)?;
-
-    let mut vertices = Vec::new();
-    let mut indices = Vec::new();
-    let mut material_ids = Vec::new();
-
-    for mesh in document.meshes() {
-        for primitive in mesh.primitives() {
-            if primitive.mode() != gltf::mesh::Mode::Triangles {
-                warn!("Skipping non-triangle primitive in mesh {:?}", mesh.name());
-                continue;
-            }
-
-            let reader = primitive.reader(|buffer| Some(&buffers[buffer.index()]));
-
-            let positions: Vec<Vec3> = reader
-                .read_positions()
-                .ok_or_else(|| anyhow!("Primitive missing POSITION attribute"))?
-                .map(|p| vec3(p[0] * scale, p[1] * scale, p[2] * scale))
-                .collect();
-
-            let normals: Vec<Vec3> = match reader.read_normals() {
-                Some(iter) => iter.map(|n| vec3(n[0], n[1], n[2])).collect(),
-                None => {
-                    // fall back to your existing flat-shaded computation
-                    let raw_indices: Vec<u32> = reader
-                        .read_indices()
-                        .map(|i| i.into_u32().collect())
-                        .unwrap_or_else(|| (0..positions.len() as u32).collect());
-                    compute_vertex_normals(&positions, &raw_indices)
-                }
-            };
-
-            let uvs: Vec<Option<cgmath::Vector2<f32>>> = match reader.read_tex_coords(0) {
-                Some(read_tex_coords) => read_tex_coords
-                    .into_f32()
-                    .map(|uv| Some(cgmath::vec2(uv[0], uv[1])))
-                    .collect(),
-                None => vec![None; positions.len()],
-            };
-
-            let vertex_offset = vertices.len() as u32;
-            vertices.extend(
-                positions.iter()
-                    .zip(normals.iter())
-                    .zip(uvs.iter())
-                    .map(|((&p, &n), &uv)| Vertex::new(p + offset, n, uv)),
-            );
-
-            let prim_indices: Vec<u32> = match reader.read_indices() {
-                Some(iter) => iter.into_u32().map(|i| i + vertex_offset + index_offset).collect(),
-                None => (0..positions.len() as u32).map(|i| i + vertex_offset + index_offset).collect(),
-            };
-
-            let mat_id = primitive.material().index().unwrap_or(0) as u32;
-            let triangle_count = prim_indices.len() / 3;
-            material_ids.extend(std::iter::repeat(mat_id).take(triangle_count));
-
-            indices.extend(prim_indices);
-        }
-    }
-
-    let textures = unsafe {
-        create_gltf_textures(instance, device, data, &images)?
-    };
-    let materials = convert_gltf_materials(&document);
-
-    Ok((vertices, indices, material_ids, materials, textures))
-}
-
-fn convert_gltf_materials(document: &gltf::Document) -> Vec<Material> {
-    document
-        .materials()
-        .map(|m| {
-            let pbr = m.pbr_metallic_roughness();
-            let base_color = pbr.base_color_factor();
-
-            let albedo_texture_index = pbr
-                .base_color_texture()
-                .map(|info| info.texture().source().index() as i32)
-                .unwrap_or(-1);
-
-            Material {
-                albedo: vec3(base_color[0], base_color[1], base_color[2]),
-                albedo_texture_index,
-                metallic: pbr.metallic_factor(),
-                roughness: pbr.roughness_factor(),
-                _pad1: [0.0, 0.0],
-            }
-        })
-        .collect()
-}
-
-unsafe fn create_gltf_textures(
-    instance: &Instance,
-    device: &Device,
-    data: &AppData,
-    images: &[gltf::image::Data],
-) -> Result<Vec<(vk::Image, vk::DeviceMemory, vk::ImageView)>> { unsafe {
-    let mut textures = Vec::new();
-
-    for img in images {
-        let (vk_format, _bpp) = gltf_to_vulkan(img.format)
-            .ok_or_else(|| anyhow!("Unsupported glTF image format: {:?}", img.format))?;
-
-        let pixels: Vec<u8> = match img.format {
-            gltf::image::Format::R8G8B8A8 => img.pixels.clone(),
-            gltf::image::Format::R8G8B8 => img.pixels
-                .chunks(3)
-                .flat_map(|rgb| [rgb[0], rgb[1], rgb[2], 255u8])
-                .collect(),
-            gltf::image::Format::R16G16B16A16 => img.pixels.clone(),
-            gltf::image::Format::R16G16B16 => {
-                let u16_pixels: &[u16] = bytemuck::cast_slice(&img.pixels);
-                u16_pixels
-                    .chunks(3)
-                    .flat_map(|rgb| [rgb[0], rgb[1], rgb[2], u16::MAX])
-                    .collect::<Vec<u16>>()
-                    .into_iter()
-                    .flat_map(|v| v.to_ne_bytes())
-                    .collect()
-            }
-            other => return Err(anyhow!("Unsupported glTF image format: {:?}", other)),
-        };
-
-        let (image, memory, view) = create_texture_image(
-            instance, device, data,
-            data.command_pool, data.graphics_queue,
-            &pixels, img.width, img.height, vk_format,
-        )?;
-
-        textures.push((image, memory, view));
-    }
-
-    Ok(textures)
-}}
-
-fn gltf_to_vulkan(format: gltf::image::Format) -> Option<(vk::Format, u32)> {
-    match format {
-        R8G8B8A8 => Some((vk::Format::R8G8B8A8_SRGB, 4)),
-        R8G8B8 => Some((vk::Format::R8G8B8A8_SRGB, 4)),
-        R16G16B16A16 => Some((vk::Format::R16G16B16A16_UNORM, 8)),
-        R16G16B16 => Some((vk::Format::R16G16B16A16_UNORM, 8)),
-        _ => None,
-    }
-}
-
-
-// Model caching functions
-fn cache_path(obj_path: &str) -> String {
-    format!("models/binaries/{}.bin", 
-        Path::new(obj_path).file_stem().unwrap().to_str().unwrap())
-}
-
-fn load_obj_cached(path: &str, scale: f32, offset: Vec3, index_offset: u32) -> Result<(Vec<Vertex>, Vec<u32>, Vec<u32>, Vec<Material>)> {
-    let bin_path = cache_path(path);
-
-    if Path::new(&bin_path).exists() {
-        info!("Loading cached binary: {}", bin_path);
-        match load_binary(&bin_path, scale, offset, index_offset) {
-            Ok(result) => {
-                info!("Loaded cached binary: {}", bin_path);
-                return Ok(result);
-            }
-            Err(e) => {
-                warn!("Cache at {} invalid ({}), deleting and reparsing", bin_path, e);
-                std::fs::remove_file(&bin_path)?;
-            }
-        }
-    }
-
-    info!("No cache found, parsing OBJ (this may take a while)...");
-    let result = load_obj(path, scale, offset, index_offset)?;
-    save_binary(&bin_path, scale, offset, index_offset, &result)?;
-    Ok(result)
-}
-
-fn save_binary(
-    path: &str, scale: f32, offset: Vec3, index_offset: u32,
-    data: &(Vec<Vertex>, Vec<u32>, Vec<u32>, Vec<Material>),
-) -> Result<()> {
-    std::fs::create_dir_all("models/binaries")?;
-    let (vertices, indices, material_ids, materials) = data;
-    let mut w = BufWriter::new(File::create(path)?);
-
-    let header = BinHeader {
-        magic: *b"VKRT",
-        version: 1,
-        vertex_count: vertices.len() as u64,
-        index_count: indices.len() as u64,
-        material_count: materials.len() as u64,
-        scale,
-        offset,
-        index_offset,
-    };
-
-    unsafe {
-        w.write_all(as_bytes(&header))?;
-        w.write_all(as_slice_bytes(vertices))?;
-        w.write_all(as_slice_bytes(indices))?;
-        w.write_all(as_slice_bytes(material_ids))?;
-        w.write_all(as_slice_bytes(materials))?;
-    }
-    Ok(())
-}
-
-fn load_binary(path: &str, scale: f32, offset: Vec3, index_offset: u32) -> Result<(Vec<Vertex>, Vec<u32>, Vec<u32>, Vec<Material>)> {
-    let mut r = BufReader::new(File::open(path)?);
-
-    let mut header = BinHeader { 
-        magic: [0;4], version: 0, 
-        vertex_count: 0, index_count: 0, material_count: 0 ,
-        scale: 1.0, offset: Vec3::new(0.0, 0.0, 0.0), index_offset: 0,
-    };
-    unsafe {r.read_exact(as_bytes_mut(&mut header))?;}
-    
-    if &header.magic != b"VKRT" {
-        return Err(anyhow!("Bad cache file magic, deleting and reparsing"));
-    }
-    if header.scale != scale {
-        return Err(anyhow!("Mismatched scale, deleting and reparsing"));
-    }
-    if header.offset != offset {
-        return Err(anyhow!("Mismatched offset, deleting and reparsing"));
-    }
-    if header.index_offset != index_offset {
-        return Err(anyhow!("Mismatched index offset, deleting and reparsing"));
-    }
-    if header.version != 1 {
-        return Err(anyhow!("Cache version mismatch"));
-    }
-
-    let vertices = read_vec::<Vertex>(&mut r, header.vertex_count as usize)?;
-    let indices = read_vec::<u32>(&mut r, header.index_count as usize)?;
-    let material_ids = read_vec::<u32>(&mut r, header.index_count as usize / 3)?;
-    let materials = read_vec::<Material>(&mut r, header.material_count as usize)?;
-
-    Ok((vertices, indices, material_ids, materials))
-}
-
 
 unsafe fn create_instance(
     window: &Window,
@@ -1313,6 +851,23 @@ unsafe fn create_instance(
     Ok(instance)
 }}
 
+unsafe fn get_memory_type_index(
+    instance: &Instance,
+    data: &AppData,
+    properties: vk::MemoryPropertyFlags,
+    requirements: vk::MemoryRequirements,
+) -> Result<u32> { unsafe {
+    let memory = instance.get_physical_device_memory_properties(data.physical_device);
+
+    (0..memory.memory_type_count)
+        .find(|i| {
+            let suitable = (requirements.memory_type_bits & (1 << i)) != 0;
+            let memory_type = memory.memory_types[*i as usize];
+            suitable && memory_type.property_flags.contains(properties)
+        })
+        .ok_or_else(|| anyhow!("Failed to find suitable memory type."))
+}}
+
 
 // Device checking
 unsafe fn check_physical_device(
@@ -1385,6 +940,7 @@ unsafe fn check_physical_device_rt_features(
 }}
 
 
+// Device functions
 unsafe fn pick_physical_device(instance: &Instance, data: &mut AppData) -> Result<()> { unsafe {
     for physical_device in instance.enumerate_physical_devices()? {
         let properties = instance.get_physical_device_properties(physical_device);
@@ -1400,7 +956,6 @@ unsafe fn pick_physical_device(instance: &Instance, data: &mut AppData) -> Resul
 
     Err(anyhow!("Failed to find suitable physical device"))
 }}
-
 
 unsafe fn create_logical_device(
     entry: &Entry,
@@ -1899,132 +1454,6 @@ unsafe fn create_storage_image(
 
 
 // Texture functions
-unsafe fn create_texture_image(
-    instance: &Instance,
-    device: &Device,
-    data: &AppData,
-    command_pool: vk::CommandPool,
-    queue: vk::Queue,
-    pixels: &[u8],
-    width: u32,
-    height: u32,
-    format: vk::Format,
-) -> Result<(vk::Image, vk::DeviceMemory, vk::ImageView)> { unsafe {
-    let size = pixels.len() as u64;
-
-    // Staging buffer
-    let (staging_buffer_raw, staging_memory) = create_buffer(
-        instance, device, data, size,
-        vk::BufferUsageFlags::TRANSFER_SRC,
-        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-    )?;
-    let staging = StagingBuffer {device, buffer: staging_buffer_raw, memory: staging_memory};
-
-    let mem = device.map_memory(staging_memory, 0, size, vk::MemoryMapFlags::empty())?;
-    
-    memcpy(pixels.as_ptr(), mem.cast::<u8>(), size as usize);
-    device.unmap_memory(staging_memory);
-
-    // Device local image
-    let image_info = vk::ImageCreateInfo::builder()
-        .image_type(vk::ImageType::_2D)
-        .format(format) // sRGB — matches glTF's baseColor color space
-        .extent(vk::Extent3D { width, height, depth: 1 })
-        .mip_levels(1) // no mipmaps yet — fine for now, add later if aliasing shows up
-        .array_layers(1)
-        .samples(vk::SampleCountFlags::_1)
-        .tiling(vk::ImageTiling::OPTIMAL)
-        .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED)
-        .sharing_mode(vk::SharingMode::EXCLUSIVE)
-        .initial_layout(vk::ImageLayout::UNDEFINED);
-
-    let image = device.create_image(&image_info, None)?;
-    let requirements = device.get_image_memory_requirements(image);
-
-    let memory_info = vk::MemoryAllocateInfo::builder()
-        .allocation_size(requirements.size)
-        .memory_type_index(get_memory_type_index(
-            instance, data, vk::MemoryPropertyFlags::DEVICE_LOCAL, requirements,
-        )?);
-
-    let memory = device.allocate_memory(&memory_info, None)?;
-    device.bind_image_memory(image, memory, 0)?;
-
-
-    let alloc_info = vk::CommandBufferAllocateInfo::builder()
-        .level(vk::CommandBufferLevel::PRIMARY)
-        .command_pool(command_pool)
-        .command_buffer_count(1);
-    let cmd = device.allocate_command_buffers(&alloc_info)?[0];
-    device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::builder()
-        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
-
-    let subresource = vk::ImageSubresourceRange::builder()
-        .aspect_mask(vk::ImageAspectFlags::COLOR)
-        .level_count(1)
-        .layer_count(1)
-        .build();
-
-    let to_transfer_barrier = vk::ImageMemoryBarrier::builder()
-        .old_layout(vk::ImageLayout::UNDEFINED)
-        .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .image(image)
-        .subresource_range(subresource)
-        .src_access_mask(vk::AccessFlags::empty())
-        .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
-
-    device.cmd_pipeline_barrier(
-        cmd, vk::PipelineStageFlags::TOP_OF_PIPE, vk::PipelineStageFlags::TRANSFER,
-        vk::DependencyFlags::empty(), &[] as &[vk::MemoryBarrier], &[] as &[vk::BufferMemoryBarrier],
-        &[to_transfer_barrier],
-    );
-
-    let region = vk::BufferImageCopy::builder()
-        .buffer_offset(0)
-        .buffer_row_length(0)
-        .buffer_image_height(0)
-        .image_subresource(vk::ImageSubresourceLayers::builder()
-            .aspect_mask(vk::ImageAspectFlags::COLOR)
-            .mip_level(0).base_array_layer(0).layer_count(1).build())
-        .image_extent(vk::Extent3D { width, height, depth: 1 });
-
-    device.cmd_copy_buffer_to_image(
-        cmd, staging.buffer, image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[region],
-    );
-
-    let to_shader_read_barrier = vk::ImageMemoryBarrier::builder()
-        .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-        .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .image(image)
-        .subresource_range(subresource)
-        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-        .dst_access_mask(vk::AccessFlags::SHADER_READ);
-
-    device.cmd_pipeline_barrier(
-        cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::RAY_TRACING_SHADER_KHR,
-        vk::DependencyFlags::empty(), &[] as &[vk::MemoryBarrier], &[] as &[vk::BufferMemoryBarrier],
-        &[to_shader_read_barrier],
-    );
-
-    device.end_command_buffer(cmd)?;
-    device.queue_submit(queue, &[vk::SubmitInfo::builder().command_buffers(&[cmd])], vk::Fence::null())?;
-    device.queue_wait_idle(queue)?;
-    device.free_command_buffers(command_pool, &[cmd]);
-
-    let view_info = vk::ImageViewCreateInfo::builder()
-        .image(image)
-        .view_type(vk::ImageViewType::_2D)
-        .format(format)
-        .subresource_range(subresource);
-    let view = device.create_image_view(&view_info, None)?;
-
-    Ok((image, memory, view))
-}}
-
 unsafe fn create_texture_sampler(device: &Device) -> Result<vk::Sampler> { unsafe {
     let info = vk::SamplerCreateInfo::builder()
         .mag_filter(vk::Filter::LINEAR)
@@ -2041,6 +1470,7 @@ unsafe fn create_texture_sampler(device: &Device) -> Result<vk::Sampler> { unsaf
 }}
 
 
+// Sync functions
 unsafe fn create_sync_objects(device: &Device, data: &mut AppData) -> Result<()> { unsafe {
     let semaphore_info = vk::SemaphoreCreateInfo::builder();
     let fence_info = vk::FenceCreateInfo::builder()
@@ -2204,24 +1634,6 @@ unsafe fn create_scene_buffers(
     data.material_ids_buffer_memory = ids_buffer_memory;
 
     Ok(())
-}}
-
-
-unsafe fn get_memory_type_index(
-    instance: &Instance,
-    data: &AppData,
-    properties: vk::MemoryPropertyFlags,
-    requirements: vk::MemoryRequirements,
-) -> Result<u32> { unsafe {
-    let memory = instance.get_physical_device_memory_properties(data.physical_device);
-
-    (0..memory.memory_type_count)
-        .find(|i| {
-            let suitable = (requirements.memory_type_bits & (1 << i)) != 0;
-            let memory_type = memory.memory_types[*i as usize];
-            suitable && memory_type.property_flags.contains(properties)
-        })
-        .ok_or_else(|| anyhow!("Failed to find suitable memory type."))
 }}
 
 
