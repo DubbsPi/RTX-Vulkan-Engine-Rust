@@ -40,6 +40,7 @@ use common::Mat4;
 
 mod scene;
 use scene::Scene;
+use scene::UintRange;
 
 
 const PORTABILITY_MACOS_VERSION: Version = Version::new(1, 3, 216);
@@ -146,6 +147,8 @@ struct App {
     camera: Camera,
     input: InputState,
     controls_enabled: bool,
+
+    scene: Scene,
 }
 
 impl App {
@@ -176,7 +179,7 @@ impl App {
         create_command_pool(&instance, &device, &mut data)?;
         create_storage_image(&instance, &device, &mut data)?;
 
-
+        // Scene setup
         let mut scene = Scene::new();
         
         let truck = Scene::load_model_into_memory(
@@ -187,27 +190,75 @@ impl App {
         scene.add_model_to_scene(&truck);
 
         scene.scale_model(0, vec3(2.0, 0.5, 1.0));
-        scene.move_model(0, vec3(3.0, -2.0, 0.0));
-
-        let novabeast = Scene::load_model_into_memory(
-            "models/Novabeast_V1_2.glb",
-            &instance, &device, &mut data,
-        )?;
-        scene.add_model_to_scene(&novabeast);
-        
-        scene.move_model(2, vec3(0.0, 1.0, 0.0));
+        scene.translate_model(0, vec3(3.0, -2.0, 0.0));
 
         
         data.texture_sampler = create_texture_sampler(&device)?;
         info!("Triangles: {}, Vertices: {}", scene.indices.len() / 3, scene.vertices.len());
+        // End scene setup
 
         create_descriptor_set_layout(&device, &mut data)?;
         create_rt_pipeline(&device, &mut data)?;
 
-        create_blas(&instance, &device, &mut data, &scene.vertices, &scene.indices)?;
-        create_tlas(&instance, &device, &mut data)?;
+        // Create index and vertex buffers
+        let vertex_size = (size_of::<Vertex>() * scene.vertices.len()) as u64;
+        let (vertex_buffer, vertex_buffer_memory) = create_buffer(
+            &instance, &device, &data, vertex_size,
+            vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
+                | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR,
+            vk::MemoryPropertyFlags::HOST_COHERENT | vk::MemoryPropertyFlags::HOST_VISIBLE,
+        )?;
+        let mem = device.map_memory(vertex_buffer_memory, 0, vertex_size, vk::MemoryMapFlags::empty())?;
+        memcpy(scene.vertices.as_ptr().cast::<u8>(), mem.cast::<u8>(), vertex_size as usize);
+        device.unmap_memory(vertex_buffer_memory);
 
-        create_scene_buffers(&instance, &device, &mut data, &scene.materials, &scene.material_ids)?;
+        let index_size = (size_of::<u32>() * scene.indices.len()) as u64;
+        let (index_buffer, index_buffer_memory) = create_buffer(
+            &instance, &device, &data, index_size,
+            vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
+                | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR,
+            vk::MemoryPropertyFlags::HOST_COHERENT | vk::MemoryPropertyFlags::HOST_VISIBLE,
+        )?;
+        let mem = device.map_memory(index_buffer_memory, 0, index_size, vk::MemoryMapFlags::empty())?;
+        memcpy(scene.indices.as_ptr().cast::<u8>(), mem.cast::<u8>(), index_size as usize);
+        device.unmap_memory(index_buffer_memory);
+
+        data.vertex_buffer = vertex_buffer;
+        data.vertex_buffer_memory = vertex_buffer_memory;
+        data.index_buffer = index_buffer;
+        data.index_buffer_memory = index_buffer_memory;
+
+
+        let vertex_address = get_buffer_device_address(&device, data.vertex_buffer);
+        let index_address = get_buffer_device_address(&device, data.index_buffer);
+        if vertex_address == 0 || index_address == 0 {
+            return Err(anyhow!("Shared vertex/index buffer has a zero device address"));
+        }
+
+        // Create blases
+        let mut blases = Vec::new();
+        let mut blases_buffer = Vec::new();
+        let mut blases_buffer_memory = Vec::new();
+        for model in &scene.model_info {
+            let (blas, buffer, memory) = create_blas_for_model(&instance, &device, &mut data, vertex_address, index_address, &model.model_vertex_range, &model.model_index_range)?;
+            blases.push(blas);
+            blases_buffer.push(buffer);
+            blases_buffer_memory.push(memory);
+        }
+
+        data.blases = blases;
+        data.blases_buffer = blases_buffer;
+        data.blases_buffer_memory = blases_buffer_memory;
+        info!("Created {} blases", data.blases.len());
+
+        create_tlas(&instance, &device, &mut data, &scene.transform_matrices)?;
+
+        create_scene_buffers(
+            &instance, &device, &mut data,
+            &scene.materials, &scene.material_ids,
+            &scene.model_info,
+            vertex_address, index_address,
+        )?;
 
         create_uniform_buffers(&instance, &device, &mut data)?;
         create_descriptor_pool(&device, &mut data)?;
@@ -233,7 +284,8 @@ impl App {
             _entry, instance: instance, data, device,
             frame, resized,
             last_frame, frame_time, start,
-            camera, input, controls_enabled
+            camera, input, controls_enabled,
+            scene
         })
     }}
 
@@ -248,11 +300,23 @@ impl App {
         self.device.destroy_acceleration_structure_khr(self.data.tlas, None);
         self.device.destroy_buffer(self.data.tlas_buffer, None);
         self.device.free_memory(self.data.tlas_buffer_memory, None);
+        
+        self.device.destroy_buffer(self.data.tlas_scratch_buffer, None);
+        self.device.free_memory(self.data.tlas_buffer_memory, None);
+        
+        self.device.destroy_buffer(self.data.instance_buffer, None);
+        self.device.free_memory(self.data.instance_buffer_memory, None);
 
-        // Blas
-        self.device.destroy_acceleration_structure_khr(self.data.blas, None);
-        self.device.destroy_buffer(self.data.blas_buffer, None);
-        self.device.free_memory(self.data.blas_buffer_memory, None);
+        // Blases
+        for blas in self.data.blases.drain(..) {
+            self.device.destroy_acceleration_structure_khr(blas, None);
+        }
+        for blas_buffer in self.data.blases_buffer.drain(..) {
+            self.device.destroy_buffer(blas_buffer, None);
+        }
+        for blas_buffer_memory in self.data.blases_buffer_memory.drain(..) {
+            self.device.free_memory(blas_buffer_memory, None);
+        }
 
         // Geometry buffers
         self.device.destroy_buffer(self.data.index_buffer, None);
@@ -339,7 +403,6 @@ impl App {
             u64::MAX,
         )?;
 
-
         if self.data.queries_valid[self.frame] {
             let mut timestamps = [0u64; 2];
             let query_result = self.device.get_query_pool_results(
@@ -353,14 +416,13 @@ impl App {
                 std::mem::size_of::<u64>() as u64,
                 vk::QueryResultFlags::_64,
             );
-            
+
             if query_result.is_ok() {
                 let ticks = timestamps[1].saturating_sub(timestamps[0]);
                 let gpu_ms = (ticks as f64 * self.data.timestamp_period as f64) / 1_000_000.0;
                 self.frame_time = gpu_ms;
             }
         }
-
 
         let image_index = match self
             .device
@@ -389,19 +451,187 @@ impl App {
         self.data.images_in_flight[image_index as usize] =
             self.data.in_flight_fences[self.frame];
 
-
         let now = Instant::now();
         let dt = (now - self.last_frame).as_secs_f32();
         self.last_frame = now;
+        let time = self.start.elapsed().as_secs_f32();
+
 
         self.update_camera(dt);
         self.update_uniform_buffer(image_index)?;
+        let matrix_updates = self.transform_models(time);
 
-        
+        // Rerecord command buffer
+        let cmd = self.data.command_buffers[image_index];
+        self.device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
+
+        let begin_info = vk::CommandBufferBeginInfo::builder();
+        self.device.begin_command_buffer(cmd, &begin_info)?;
+
+        self.update_tlas(cmd, &matrix_updates);
+
+
+        self.device.cmd_reset_query_pool(
+            cmd,
+            self.data.timestamp_query_pool,
+            (image_index as u32) * 2,
+            2,
+        );
+
+        self.device.cmd_write_timestamp(
+            cmd,
+            vk::PipelineStageFlags::TOP_OF_PIPE,
+            self.data.timestamp_query_pool,
+            (image_index as u32) * 2,
+        );
+
+        self.device.cmd_bind_pipeline(
+            cmd,
+            vk::PipelineBindPoint::RAY_TRACING_KHR,
+            self.data.rt_pipeline,
+        );
+        self.device.cmd_bind_descriptor_sets(
+            cmd,
+            vk::PipelineBindPoint::RAY_TRACING_KHR,
+            self.data.rt_pipeline_layout,
+            0,
+            &[self.data.descriptor_sets[image_index]],
+            &[],
+        );
+
+        self.device.cmd_trace_rays_khr(
+            cmd,
+            &self.data.sbt_raygen_region,
+            &self.data.sbt_miss_region,
+            &self.data.sbt_hit_region,
+            &self.data.sbt_callable_region,
+            self.data.swapchain_extent.width,
+            self.data.swapchain_extent.height,
+            1,
+        );
+
+        let storage_image_barrier = vk::ImageMemoryBarrier::builder()
+            .old_layout(vk::ImageLayout::GENERAL)
+            .new_layout(vk::ImageLayout::GENERAL)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(self.data.storage_images[image_index])
+            .subresource_range(vk::ImageSubresourceRange::builder()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .base_mip_level(0)
+                .level_count(1)
+                .base_array_layer(0)
+                .layer_count(1)
+                .build())
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+
+        let swapchain_image_barrier = vk::ImageMemoryBarrier::builder()
+            .old_layout(vk::ImageLayout::UNDEFINED)
+            .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(self.data.swapchain_images[image_index])
+            .subresource_range(vk::ImageSubresourceRange::builder()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .base_mip_level(0)
+                .level_count(1)
+                .base_array_layer(0)
+                .layer_count(1)
+                .build())
+            .src_access_mask(vk::AccessFlags::empty())
+            .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
+
+        self.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::RAY_TRACING_SHADER_KHR,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[] as &[vk::MemoryBarrier],
+            &[] as &[vk::BufferMemoryBarrier],
+            &[storage_image_barrier, swapchain_image_barrier],
+        );
+
+        let blit_region = vk::ImageBlit::builder()
+            .src_subresource(vk::ImageSubresourceLayers::builder()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .mip_level(0)
+                .base_array_layer(0)
+                .layer_count(1)
+                .build())
+            .src_offsets([
+                vk::Offset3D {x: 0, y: 0, z: 0},
+                vk::Offset3D {
+                    x: self.data.swapchain_extent.width as i32,
+                    y: self.data.swapchain_extent.height as i32,
+                    z: 1,
+                },
+            ])
+            .dst_subresource(vk::ImageSubresourceLayers::builder()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .mip_level(0)
+                .base_array_layer(0)
+                .layer_count(1)
+                .build())
+            .dst_offsets([
+                vk::Offset3D {x: 0, y: 0, z: 0},
+                vk::Offset3D {
+                    x: self.data.swapchain_extent.width as i32,
+                    y: self.data.swapchain_extent.height as i32,
+                    z: 1,
+                },
+            ]);
+
+        self.device.cmd_blit_image(
+            cmd,
+            self.data.storage_images[image_index],
+            vk::ImageLayout::GENERAL,
+            self.data.swapchain_images[image_index],
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &[blit_region],
+            vk::Filter::NEAREST,
+        );
+
+        let present_barrier = vk::ImageMemoryBarrier::builder()
+            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(self.data.swapchain_images[image_index])
+            .subresource_range(vk::ImageSubresourceRange::builder()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .base_mip_level(0)
+                .level_count(1)
+                .base_array_layer(0)
+                .layer_count(1)
+                .build())
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::empty());
+
+        self.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+            vk::DependencyFlags::empty(),
+            &[] as &[vk::MemoryBarrier],
+            &[] as &[vk::BufferMemoryBarrier],
+            &[present_barrier],
+        );
+
+        self.device.cmd_write_timestamp(
+            cmd,
+            vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+            self.data.timestamp_query_pool,
+            (image_index as u32) * 2 + 1,
+        );
+
+        self.device.end_command_buffer(cmd)?;
+
+        // Submit
         let wait_semaphores = &[self.data.image_available_semaphores[self.frame]];
-        let wait_stages = &[vk::PipelineStageFlags::TRANSFER];
-        
-        let command_buffers = &[self.data.command_buffers[image_index as usize]];
+        let wait_stages = &[vk::PipelineStageFlags::ACCELERATION_STRUCTURE_BUILD_KHR];
+
+        let command_buffers = &[cmd];
         let signal_semaphores = &[self.data.render_finished_semaphores[image_index]];
         let submit_info = vk::SubmitInfo::builder()
             .wait_semaphores(wait_semaphores)
@@ -418,14 +648,13 @@ impl App {
         )?;
 
         self.data.queries_valid[self.frame] = true;
-        
+
         let swapchains = &[self.data.swapchain];
         let image_indices = &[image_index as u32];
         let present_info = vk::PresentInfoKHR::builder()
             .wait_semaphores(signal_semaphores)
             .swapchains(swapchains)
             .image_indices(image_indices);
-
 
         let result = self.device.queue_present_khr(self.data.present_queue, &present_info);
 
@@ -514,6 +743,72 @@ impl App {
         Ok(())
     }}
 
+    unsafe fn update_tlas(&mut self, cmd: vk::CommandBuffer, updates: &[(usize, Mat4)]) { unsafe {
+        if updates.is_empty() {
+            return;
+        }
+
+        let instance_stride = size_of::<RtAccelerationStructureInstance>();
+
+        for &(model_index, transform) in updates {
+            let vk_transform = mat4_to_vk_transform(&transform);
+            let offset = model_index * instance_stride; // transform is the first field, offset 0 within the struct
+
+            std::ptr::copy_nonoverlapping(
+                (&vk_transform as *const vk::TransformMatrixKHR).cast::<u8>(),
+                self.data.instance_buffer_mapped.add(offset),
+                size_of::<vk::TransformMatrixKHR>(),
+            );
+        }
+
+
+        let instances_data = vk::AccelerationStructureGeometryInstancesDataKHR::builder()
+            .array_of_pointers(false)
+            .data(vk::DeviceOrHostAddressConstKHR { device_address: self.data.instance_buffer_addr })
+            .build();
+
+        let geometry = vk::AccelerationStructureGeometryKHR::builder()
+            .geometry_type(vk::GeometryTypeKHR::INSTANCES)
+            .geometry(vk::AccelerationStructureGeometryDataKHR { instances: instances_data })
+            .build();
+        let geometries = &[geometry];
+
+        let build_info = vk::AccelerationStructureBuildGeometryInfoKHR::builder()
+            .type_(vk::AccelerationStructureTypeKHR::TOP_LEVEL)
+            .flags(
+                vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE
+                    | vk::BuildAccelerationStructureFlagsKHR::ALLOW_UPDATE,
+            )
+            .mode(vk::BuildAccelerationStructureModeKHR::UPDATE)
+            .src_acceleration_structure(self.data.tlas)
+            .dst_acceleration_structure(self.data.tlas)
+            .geometries(geometries)
+            .scratch_data(vk::DeviceOrHostAddressKHR { device_address: self.data.tlas_scratch_addr });
+
+        let range_info = vk::AccelerationStructureBuildRangeInfoKHR::builder()
+            .primitive_count(self.data.instance_count)
+            .primitive_offset(0)
+            .first_vertex(0)
+            .transform_offset(0)
+            .build();
+
+        self.device.cmd_build_acceleration_structures_khr(cmd, &[build_info], &[&[range_info]]);
+
+        let barrier = vk::MemoryBarrier::builder()
+            .src_access_mask(vk::AccessFlags::ACCELERATION_STRUCTURE_WRITE_KHR)
+            .dst_access_mask(vk::AccessFlags::ACCELERATION_STRUCTURE_READ_KHR);
+
+        self.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::ACCELERATION_STRUCTURE_BUILD_KHR,
+            vk::PipelineStageFlags::RAY_TRACING_SHADER_KHR,
+            vk::DependencyFlags::empty(),
+            &[barrier],
+            &[] as &[vk::BufferMemoryBarrier],
+            &[] as &[vk::ImageMemoryBarrier],
+        );
+    }}
+
     fn update_camera(&mut self, dt: f32) {
         if self.controls_enabled {
             self.camera.yaw += self.input.mouse_dx * self.camera.sensitivity;
@@ -539,6 +834,15 @@ impl App {
                 self.camera.position += delta;
             }
         }
+    }
+
+    fn transform_models(&mut self, time: f32) -> Vec<(usize, Mat4)> {
+        let mut updates = Vec::new();
+
+        let rot = Mat4::from_angle_y(cgmath::Rad(time * 4.0));
+        updates.push((0, self.scene.transform_matrices[0] * rot));
+
+        updates
     }
 }
 
@@ -583,14 +887,22 @@ struct AppData {
     texture_sampler: vk::Sampler,
 
     // Blas
-    blas: vk::AccelerationStructureKHR,
-    blas_buffer: vk::Buffer,
-    blas_buffer_memory: vk::DeviceMemory,
+    blases: Vec<vk::AccelerationStructureKHR>,
+    blases_buffer: Vec<vk::Buffer>,
+    blases_buffer_memory: Vec<vk::DeviceMemory>,
 
     // Tlas
     tlas: vk::AccelerationStructureKHR,
     tlas_buffer: vk::Buffer,
     tlas_buffer_memory: vk::DeviceMemory,
+    tlas_scratch_buffer: vk::Buffer,
+    tlas_scratch_buffer_memory: vk::DeviceMemory,
+    tlas_scratch_addr: vk::DeviceAddress,
+    instance_buffer: vk::Buffer,
+    instance_buffer_memory: vk::DeviceMemory,
+    instance_buffer_mapped: *mut u8,
+    instance_buffer_addr: vk::DeviceAddress,
+    instance_count: u32,
 
     // Descriptors
     descriptor_set_layout: vk::DescriptorSetLayout,
@@ -867,6 +1179,16 @@ unsafe fn get_memory_type_index(
         })
         .ok_or_else(|| anyhow!("Failed to find suitable memory type."))
 }}
+
+fn mat4_to_vk_transform(m: &Mat4) -> vk::TransformMatrixKHR {
+    vk::TransformMatrixKHR {
+        matrix: [
+            [m[0][0], m[1][0], m[2][0], m[3][0]],
+            [m[0][1], m[1][1], m[2][1], m[3][1]],
+            [m[0][2], m[1][2], m[2][2], m[3][2]],
+        ],
+    }
+}
 
 
 // Device checking
@@ -1512,9 +1834,6 @@ unsafe fn create_buffer(
 
     let requirements = device.get_buffer_memory_requirements(buffer);
 
-    // If this buffer was created with SHADER_DEVICE_ADDRESS usage, the
-    // memory allocation needs the matching flag or get_buffer_device_address
-    // will fail validation even though everything else checks out.
     let mut flags_info = vk::MemoryAllocateFlagsInfo::builder()
         .flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
 
@@ -1581,6 +1900,9 @@ unsafe fn create_scene_buffers(
     data: &mut AppData,
     materials: &[Material],
     prim_material_ids: &[u32],
+    model_info: &[scene::ModelInfo],
+    vertex_address: u64,
+    index_address: u64,
 ) -> Result<()> { unsafe {
     // Material buffer
     let materials_size = (size_of::<Material>() * materials.len().max(1)) as u64;
@@ -1597,12 +1919,16 @@ unsafe fn create_scene_buffers(
     }
 
     // ObjectDesc buffer
-    let object_descs = vec![ObjectDesc {
-        vertex_address: get_buffer_device_address(device, data.vertex_buffer),
-        index_address: get_buffer_device_address(device, data.index_buffer),
-        material_id: 0,
-        _pad: 0,
-    }];
+    let object_descs: Vec<ObjectDesc> = model_info
+        .iter()
+        .map(|_model| ObjectDesc {
+            vertex_address, // no offset — indices are global
+            index_address: index_address + (_model.model_index_range.min as u64 * size_of::<u32>() as u64), // index buffer offset still needed
+            material_id: 0,
+            _pad: 0,
+        })
+        .collect();
+
     let objects_size = (size_of::<ObjectDesc>() * object_descs.len()) as u64;
     let (objects_buffer, objects_buffer_memory) = create_buffer(
         instance, device, data, objects_size,
@@ -1638,65 +1964,31 @@ unsafe fn create_scene_buffers(
 
 
 // Acceleration struct creation
-unsafe fn create_blas(
+unsafe fn create_blas_for_model(
     instance: &Instance,
     device: &Device,
-    data: &mut AppData,
-    vertices: &[Vertex],
-    indices: &[u32],
-) -> Result<()> { unsafe {
-    let vertex_size = (size_of::<Vertex>() * vertices.len()) as u64;
-    let (vertex_buffer, vertex_buffer_memory) = create_buffer(
-        instance, device, data, vertex_size,
-        vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
-            | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR,
-        vk::MemoryPropertyFlags::HOST_COHERENT | vk::MemoryPropertyFlags::HOST_VISIBLE,
-    )?;
+    data: &AppData,
+    vertex_address: u64,
+    index_address: u64,
+    vertex_range: &UintRange,
+    index_range: &UintRange,
+) -> Result<(vk::AccelerationStructureKHR, vk::Buffer, vk::DeviceMemory)> { unsafe {
+    let triangle_count = (index_range.max - index_range.min) / 3;
+    let model_vertex_count = vertex_range.max - vertex_range.min;
 
-    let mem = device.map_memory(vertex_buffer_memory, 0, vertex_size, vk::MemoryMapFlags::empty())?;
-    memcpy(
-        vertices.as_ptr().cast::<u8>(),
-        mem.cast::<u8>(),
-        size_of::<Vertex>() * vertices.len(),
-    );
-    device.unmap_memory(vertex_buffer_memory);
-
-    let index_size = (size_of::<u32>() * indices.len()) as u64;
-    let (index_buffer, index_buffer_memory) = create_buffer(
-        instance, device, data, index_size,
-        vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
-            | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR,
-        vk::MemoryPropertyFlags::HOST_COHERENT | vk::MemoryPropertyFlags::HOST_VISIBLE,
-    )?;
-
-    let mem = device.map_memory(index_buffer_memory, 0, index_size, vk::MemoryMapFlags::empty())?;
-    memcpy(
-        indices.as_ptr().cast::<u8>(),
-        mem.cast::<u8>(),
-        size_of::<u32>() * indices.len(),
-    );
-    device.unmap_memory(index_buffer_memory);
-
-
-    let index_addr = get_buffer_device_address(device, index_buffer);
-    if index_addr == 0 {
-        return Err(anyhow!("BLAS index buffer has a zero device address"));
+    if triangle_count == 0 || model_vertex_count == 0 {
+        return Err(anyhow!("Cannot build BLAS for empty mesh ranges"));
     }
 
-    let vertex_addr = get_buffer_device_address(device, vertex_buffer);
-    if vertex_addr == 0 {
-        return Err(anyhow!("BLAS vertex buffer has a zero device address"));
-    }
-    
-    let triangle_count = (indices.len() / 3) as u32;
+    let model_index_address = index_address + (index_range.min as u64 * size_of::<u32>() as u64);
 
     let triangles_data = vk::AccelerationStructureGeometryTrianglesDataKHR::builder()
         .vertex_format(vk::Format::R32G32B32_SFLOAT)
-        .vertex_data(vk::DeviceOrHostAddressConstKHR { device_address: vertex_addr })
+        .vertex_data(vk::DeviceOrHostAddressConstKHR { device_address: vertex_address }) // <- no offset, indices are global
         .vertex_stride(size_of::<Vertex>() as u64)
-        .max_vertex(vertices.len() as u32 - 1)
+        .max_vertex(vertex_range.max - 1) // <- max GLOBAL index this model can reference
         .index_type(vk::IndexType::UINT32)
-        .index_data(vk::DeviceOrHostAddressConstKHR { device_address: index_addr })
+        .index_data(vk::DeviceOrHostAddressConstKHR { device_address: model_index_address })
         .build();
 
     let geometry = vk::AccelerationStructureGeometryKHR::builder()
@@ -1706,7 +1998,6 @@ unsafe fn create_blas(
         .build();
 
     let geometries = &[geometry];
-
     let mut build_info = vk::AccelerationStructureBuildGeometryInfoKHR::builder()
         .type_(vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL)
         .flags(vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE)
@@ -1714,7 +2005,6 @@ unsafe fn create_blas(
         .geometries(geometries);
 
     let mut size_info = vk::AccelerationStructureBuildSizesInfoKHR::default();
-
     device.get_acceleration_structure_build_sizes_khr(
         vk::AccelerationStructureBuildTypeKHR::DEVICE,
         &build_info,
@@ -1722,13 +2012,10 @@ unsafe fn create_blas(
         &mut size_info,
     );
 
-
-    // Create acceleration structure
+    // Create blas buffer
     let (as_buffer, as_buffer_memory) = create_buffer(
-        instance, device, data,
-        size_info.acceleration_structure_size,
-        vk::BufferUsageFlags::ACCELERATION_STRUCTURE_STORAGE_KHR
-            | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+        instance, device, data, size_info.acceleration_structure_size,
+        vk::BufferUsageFlags::ACCELERATION_STRUCTURE_STORAGE_KHR | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
         vk::MemoryPropertyFlags::DEVICE_LOCAL,
     )?;
 
@@ -1736,21 +2023,23 @@ unsafe fn create_blas(
         .buffer(as_buffer)
         .size(size_info.acceleration_structure_size)
         .type_(vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL);
-
     let blas = device.create_acceleration_structure_khr(&create_info, None)?;
 
+    // Scratch buffer with extra padding
+    let scratch_alignment = 256u64;
     let (scratch_buffer, scratch_buffer_memory) = create_buffer(
-        instance, device, data,
-        size_info.build_scratch_size,
+        instance, device, data, size_info.build_scratch_size + scratch_alignment,
         vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
         vk::MemoryPropertyFlags::DEVICE_LOCAL,
     )?;
-    let scratch_addr = get_buffer_device_address(device, scratch_buffer);
-    
-    // Submit build
+
+    let raw_scratch_addr = get_buffer_device_address(device, scratch_buffer);
+    let aligned_scratch_addr = (raw_scratch_addr + scratch_alignment - 1) & !(scratch_alignment - 1);
+
     build_info = build_info
         .dst_acceleration_structure(blas)
-        .scratch_data(vk::DeviceOrHostAddressKHR { device_address: scratch_addr });
+        .scratch_data(vk::DeviceOrHostAddressKHR { device_address: aligned_scratch_addr });
+
 
     let range_info = vk::AccelerationStructureBuildRangeInfoKHR::builder()
         .primitive_count(triangle_count)
@@ -1776,61 +2065,53 @@ unsafe fn create_blas(
     );
 
     device.end_command_buffer(cmd)?;
-    
-    let cmd_buffers = &[cmd];
-    let submit_info = vk::SubmitInfo::builder().command_buffers(cmd_buffers);
+
+    let command_buffers = [cmd];
+    let submit_info = vk::SubmitInfo::builder().command_buffers(&command_buffers);
     device.queue_submit(data.graphics_queue, &[submit_info], vk::Fence::null())?;
     device.queue_wait_idle(data.graphics_queue)?;
     device.free_command_buffers(data.command_pool, &[cmd]);
 
-    // Clean up and store
+    // Cleanup scratch
     device.destroy_buffer(scratch_buffer, None);
     device.free_memory(scratch_buffer_memory, None);
 
-    data.vertex_buffer = vertex_buffer;
-    data.vertex_buffer_memory = vertex_buffer_memory;
-
-    data.index_buffer = index_buffer;
-    data.index_buffer_memory = index_buffer_memory;
-
-    data.blas = blas;
-    data.blas_buffer = as_buffer;
-    data.blas_buffer_memory = as_buffer_memory;
-
-    Ok(())
+    Ok((blas, as_buffer, as_buffer_memory))
 }}
 
 unsafe fn create_tlas(
     instance: &Instance,
     device: &Device,
     data: &mut AppData,
+    model_transforms: &[Mat4],
 ) -> Result<()> { unsafe {
-    // Get blas address
-    let blas_addr_info = vk::AccelerationStructureDeviceAddressInfoKHR::builder()
-        .acceleration_structure(data.blas);
+    assert_eq!(data.blases.len(), model_transforms.len(), "One transform per model expected");
 
-    let blas_address = device.get_acceleration_structure_device_address_khr(&blas_addr_info);
+    // Build the instance array
+    let instances: Vec<RtAccelerationStructureInstance> = data.blases
+        .iter()
+        .enumerate()
+        .map(|(i, &blas)| {
+            let addr_info = vk::AccelerationStructureDeviceAddressInfoKHR::builder()
+                .acceleration_structure(blas);
+            let blas_address = device.get_acceleration_structure_device_address_khr(&addr_info);
 
-    let transform = vk::TransformMatrixKHR {
-        matrix: [
-            [1.0, 0.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0, 0.0],
-            [0.0, 0.0, 1.0, 0.0],
-        ],
-    };
+            RtAccelerationStructureInstance {
+                transform: mat4_to_vk_transform(&model_transforms[i]),
+                instance_custom_index_and_mask: pack_custom_index_and_mask(i as u32, 0xFF),
+                instance_sbt_record_offset_and_flags: pack_sbt_offset_and_flags(
+                    0,
+                    vk::GeometryInstanceFlagsKHR::TRIANGLE_FACING_CULL_DISABLE,
+                ),
+                acceleration_structure_reference: blas_address,
+            }
+        })
+        .collect();
 
-    let blas_instance = RtAccelerationStructureInstance {
-        transform,
-        instance_custom_index_and_mask: pack_custom_index_and_mask(0, 0xFF),
-        instance_sbt_record_offset_and_flags: pack_sbt_offset_and_flags(
-            0,
-            vk::GeometryInstanceFlagsKHR::TRIANGLE_FACING_CULL_DISABLE,
-        ),
-        acceleration_structure_reference: blas_address,
-    };
+    let instance_count = instances.len() as u32;
+    let instance_size = (size_of::<RtAccelerationStructureInstance>() * instances.len()) as u64;
 
-    let instance_size = size_of::<RtAccelerationStructureInstance>() as u64;
-
+    // Instance buffer creation
     let (instance_buffer, instance_buffer_memory) = create_buffer(
         instance, device, data, instance_size,
         vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
@@ -1838,40 +2119,39 @@ unsafe fn create_tlas(
         vk::MemoryPropertyFlags::HOST_COHERENT | vk::MemoryPropertyFlags::HOST_VISIBLE,
     )?;
 
-    let mem = device.map_memory(instance_buffer_memory, 0, instance_size, vk::MemoryMapFlags::empty())?;
-    memcpy(
-        (&blas_instance as *const RtAccelerationStructureInstance).cast::<u8>(),
-        mem.cast::<u8>(),
-        size_of::<RtAccelerationStructureInstance>(),
-    );
+    let mapped = device.map_memory(instance_buffer_memory, 0, instance_size, vk::MemoryMapFlags::empty())?
+        as *mut u8;
+    memcpy(instances.as_ptr().cast::<u8>(), mapped, instance_size as usize);
     device.unmap_memory(instance_buffer_memory);
 
-
     let instance_buffer_addr = get_buffer_device_address(device, instance_buffer);
+    if instance_buffer_addr == 0 {
+        return Err(anyhow!("TLAS instance buffer has a zero device address"));
+    }
 
     let instances_data = vk::AccelerationStructureGeometryInstancesDataKHR::builder()
         .array_of_pointers(false)
-        .data(vk::DeviceOrHostAddressConstKHR {device_address: instance_buffer_addr})
+        .data(vk::DeviceOrHostAddressConstKHR { device_address: instance_buffer_addr })
         .build();
 
     let geometry = vk::AccelerationStructureGeometryKHR::builder()
         .geometry_type(vk::GeometryTypeKHR::INSTANCES)
-        .geometry(vk::AccelerationStructureGeometryDataKHR {instances: instances_data})
+        .geometry(vk::AccelerationStructureGeometryDataKHR { instances: instances_data })
         .build();
 
     let geometries = &[geometry];
-    let instance_count = 1u32;
 
     // Get sizes
     let build_info = vk::AccelerationStructureBuildGeometryInfoKHR::builder()
         .type_(vk::AccelerationStructureTypeKHR::TOP_LEVEL)
-        .flags(vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE)
+        .flags(
+            vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE
+                | vk::BuildAccelerationStructureFlagsKHR::ALLOW_UPDATE,
+        )
         .mode(vk::BuildAccelerationStructureModeKHR::BUILD)
         .geometries(geometries);
 
-
     let mut size_info = vk::AccelerationStructureBuildSizesInfoKHR::default();
-    
     device.get_acceleration_structure_build_sizes_khr(
         vk::AccelerationStructureBuildTypeKHR::DEVICE,
         &build_info,
@@ -1879,7 +2159,7 @@ unsafe fn create_tlas(
         &mut size_info,
     );
 
-
+    // Tlas storage
     let (as_buffer, as_buffer_memory) = create_buffer(
         instance, device, data,
         size_info.acceleration_structure_size,
@@ -1895,15 +2175,18 @@ unsafe fn create_tlas(
 
     let tlas = device.create_acceleration_structure_khr(&create_info, None)?;
 
-    // Build
+    // Scratch buffer
+    let scratch_size = size_info.build_scratch_size.max(size_info.update_scratch_size);
+    let scratch_alignment = 256u64; // or query minAccelerationStructureScratchOffsetAlignment properly
     let (scratch_buffer, scratch_buffer_memory) = create_buffer(
         instance, device, data,
-        size_info.build_scratch_size,
+        scratch_size + scratch_alignment,
         vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
         vk::MemoryPropertyFlags::DEVICE_LOCAL,
     )?;
-    
-    let scratch_addr = get_buffer_device_address(device, scratch_buffer);
+
+    let raw_scratch_addr = get_buffer_device_address(device, scratch_buffer);
+    let scratch_addr = (raw_scratch_addr + scratch_alignment - 1) & !(scratch_alignment - 1);
 
     let build_info = build_info
         .dst_acceleration_structure(tlas)
@@ -1916,37 +2199,39 @@ unsafe fn create_tlas(
         .transform_offset(0)
         .build();
 
+    // Sumbit build
     let alloc_info = vk::CommandBufferAllocateInfo::builder()
         .level(vk::CommandBufferLevel::PRIMARY)
         .command_pool(data.command_pool)
         .command_buffer_count(1);
-
     let cmd = device.allocate_command_buffers(&alloc_info)?[0];
-
 
     let begin_info = vk::CommandBufferBeginInfo::builder()
         .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-
     device.begin_command_buffer(cmd, &begin_info)?;
-
     device.cmd_build_acceleration_structures_khr(cmd, &[build_info], &[&[range_info]]);
-
     device.end_command_buffer(cmd)?;
+
     let cmd_buffers = &[cmd];
     let submit_info = vk::SubmitInfo::builder().command_buffers(cmd_buffers);
     device.queue_submit(data.graphics_queue, &[submit_info], vk::Fence::null())?;
     device.queue_wait_idle(data.graphics_queue)?;
     device.free_command_buffers(data.command_pool, &[cmd]);
 
-    // Cleanup and store
-    device.destroy_buffer(scratch_buffer, None);
-    device.free_memory(scratch_buffer_memory, None);
-    device.destroy_buffer(instance_buffer, None);
-    device.free_memory(instance_buffer_memory, None);
-
+    // Store
     data.tlas = tlas;
     data.tlas_buffer = as_buffer;
     data.tlas_buffer_memory = as_buffer_memory;
+
+    data.tlas_scratch_buffer = scratch_buffer;
+    data.tlas_scratch_buffer_memory = scratch_buffer_memory;
+    data.tlas_scratch_addr = scratch_addr;
+
+    data.instance_buffer = instance_buffer;
+    data.instance_buffer_memory = instance_buffer_memory;
+    data.instance_buffer_mapped = mapped;
+    data.instance_buffer_addr = instance_buffer_addr;
+    data.instance_count = instance_count;
 
     Ok(())
 }}

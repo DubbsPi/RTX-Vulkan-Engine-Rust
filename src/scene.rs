@@ -8,6 +8,7 @@ use gltf::image::Data;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
+use cgmath::SquareMatrix;
 use cgmath::vec3;
 
 use anyhow::{anyhow, Result};
@@ -21,6 +22,7 @@ use vulkanalia::vk::Handle;
 use crate::Vertex;
 use crate::Material;
 use crate::Vec3;
+use crate::Mat4;
 
 
 pub struct UintRange {
@@ -59,12 +61,13 @@ pub struct Scene {
     material_map: HashMap<Material, u32>,
 
     pub model_info: Vec<ModelInfo>,
+    pub transform_matrices: Vec<Mat4>,
 }
 
 impl Scene {
     pub fn new() -> Self {
         info!("Scene initiated!");
-        Self {vertices: Vec::new(), indices: Vec::new(), material_ids: Vec::new(), materials: Vec::new(), material_map: HashMap::new(), model_info: Vec::new()}
+        Self {vertices: Vec::new(), indices: Vec::new(), material_ids: Vec::new(), materials: Vec::new(), material_map: HashMap::new(), model_info: Vec::new(), transform_matrices: Vec::new()}
     }
 
     pub unsafe fn load_model_into_memory(path: &str, instance: &crate::Instance, device: &crate::Device, data: &mut crate::AppData) -> Result<Model> {
@@ -81,7 +84,7 @@ impl Scene {
                 }
             }
         }
-
+        
         info!("Loaded {} into memory", path);
         Ok(Model {vertices, indices, material_ids, materials})
     }
@@ -89,6 +92,10 @@ impl Scene {
     pub fn add_model_to_scene(&mut self, model: &Model) {
         let vertex_offset = self.vertices.len() as u32;
         let index_offset = self.indices.len() as u32;
+
+        // Default matrix
+        let transform_matrix = Mat4::identity();
+        self.transform_matrices.push(transform_matrix);
 
         // Add vertices/indices
         let base_vertex = self.vertices.len() as u32;
@@ -138,43 +145,16 @@ impl Scene {
         });
     }
 
-    pub fn move_model(&mut self, model_id: usize, position: Vec3) {
-        for i in self.model_info[model_id].model_vertex_range.min..self.model_info[model_id].model_vertex_range.max {
-            self.vertices[i as usize].pos += position;
-        }
+    pub fn translate_model(&mut self, model_id: usize, offset: Vec3) {
+        self.transform_matrices[model_id] = Mat4::from_translation(offset) * self.transform_matrices[model_id];
     }
 
     pub fn scale_model(&mut self, model_id: usize, scale: Vec3) {
-        let start = self.model_info[model_id].model_vertex_range.min as usize;
-        let end = self.model_info[model_id].model_vertex_range.max as usize;
+        self.transform_matrices[model_id] = Mat4::from_nonuniform_scale(scale.x, scale.y, scale.z) * self.transform_matrices[model_id];
+    }
 
-        let inverse_scale = vec3(
-            if scale.x.abs() < f32::EPSILON { 1.0 } else { 1.0 / scale.x },
-            if scale.y.abs() < f32::EPSILON { 1.0 } else { 1.0 / scale.y },
-            if scale.z.abs() < f32::EPSILON { 1.0 } else { 1.0 / scale.z },
-        );
-
-        for i in start..end {
-            let vertex = &mut self.vertices[i];
-            vertex.pos.x *= scale.x;
-            vertex.pos.y *= scale.y;
-            vertex.pos.z *= scale.z;
-
-            let transformed_normal = vec3(
-                vertex.normal.x * inverse_scale.x,
-                vertex.normal.y * inverse_scale.y,
-                vertex.normal.z * inverse_scale.z,
-            );
-
-            let len_sq = transformed_normal.x * transformed_normal.x
-                + transformed_normal.y * transformed_normal.y
-                + transformed_normal.z * transformed_normal.z;
-
-            if len_sq > 0.0 {
-                let len = len_sq.sqrt();
-                vertex.normal = transformed_normal / len;
-            }
-        }
+    pub fn set_transform(&mut self, model_id: usize, transform: Mat4) {
+        self.transform_matrices[model_id] = transform;
     }
 }
 
