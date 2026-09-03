@@ -46,7 +46,7 @@ struct ObjectDesc {
     uint64_t vertexAddress;
     uint64_t indexAddress;
     uint materialId;
-    uint primitiveOffset;
+    uint pad0;
 };
 
 struct Material {

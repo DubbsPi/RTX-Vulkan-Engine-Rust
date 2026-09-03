@@ -1,4 +1,4 @@
-// Some aspects of code are not used yet here. They will be used for transforms though
+// Some aspects of code are not used yet here. They will be used for though
 #![expect(dead_code)]
 
 
@@ -25,6 +25,7 @@ use crate::Vec3;
 use crate::Mat4;
 use crate::common::Skeleton;
 use crate::common::Bone;
+use crate::common::{AnimationChannel, AnimationClip, AnimationPlayer};
 
 
 pub struct UintRange {
@@ -54,6 +55,7 @@ pub struct Model {
     materials: Vec<Material>,
 
     skeleton: Option<Skeleton>,
+    animations: Vec<AnimationClip>,
 }
 
 
@@ -67,16 +69,25 @@ pub struct Scene {
 
     pub model_info: Vec<ModelInfo>,
     pub transform_matrices: Vec<Mat4>,
+
+    pub animations: Vec<AnimationPlayer>,
 }
 
 impl Scene {
     pub fn new() -> Self {
         info!("Scene initiated!");
-        Self {vertices: Vec::new(), indices: Vec::new(), material_ids: Vec::new(), materials: Vec::new(), material_map: HashMap::new(), model_info: Vec::new(), transform_matrices: Vec::new()}
+        Self {
+            vertices: Vec::new(), indices: Vec::new(),
+            material_ids: Vec::new(), materials: Vec::new(),
+            material_map: HashMap::new(),
+            model_info: Vec::new(),
+            transform_matrices: Vec::new(),
+            animations: Vec::new(),
+        }
     }
 
     pub unsafe fn load_model_into_memory(path: &str, instance: &crate::Instance, device: &crate::Device, data: &mut crate::AppData) -> Result<Model> {
-        let (vertices, indices, material_ids, mut materials, images, skeleton) = load_gltf(path)?;
+        let (vertices, indices, material_ids, mut materials, images, skeleton, animations) = load_gltf(path)?;
 
         unsafe {
             let texture_offset = data.textures.len() as i32;
@@ -91,7 +102,7 @@ impl Scene {
         }
         
         info!("Loaded {} into memory", path);
-        Ok(Model {vertices, indices, material_ids, materials, skeleton})
+        Ok(Model {vertices, indices, material_ids, materials, skeleton, animations})
     }
 
     pub fn add_model_to_scene(&mut self, model: &Model) {
@@ -136,20 +147,13 @@ impl Scene {
         
         // Save model info
         self.model_info.push(ModelInfo {
-            model_vertex_range: UintRange {
-                min: vertex_offset,
-                max: vertex_offset + model.vertices.len() as u32,
-            },
-
-            model_index_range: UintRange {
-                min: index_offset,
-                max: index_offset + model.indices.len() as u32,
-            },
-
+            model_vertex_range: UintRange {min: vertex_offset, max: vertex_offset + model.vertices.len() as u32},
+            model_index_range: UintRange {min: index_offset, max: index_offset + model.indices.len() as u32},
             model_material_mappings: material_mapping,
-
             skeleton: model.skeleton.clone(),
         });
+
+        self.animations.push(AnimationPlayer::new(model.animations.clone()));
     }
 
     pub fn translate_model(&mut self, model_id: usize, offset: Vec3) {
@@ -166,7 +170,7 @@ impl Scene {
 }
 
 
-fn load_gltf(path: &str) -> Result<(Vec<Vertex>, Vec<u32>, Vec<u32>, Vec<Material>,Vec<Data>, Option<Skeleton>,)> {
+fn load_gltf(path: &str) -> Result<(Vec<Vertex>, Vec<u32>, Vec<u32>, Vec<Material>,Vec<Data>, Option<Skeleton>, Vec<AnimationClip>)> {
     let (document, buffers, images) = gltf::import(path)?;
 
     let mut vertices = Vec::new();
@@ -245,8 +249,13 @@ fn load_gltf(path: &str) -> Result<(Vec<Vertex>, Vec<u32>, Vec<u32>, Vec<Materia
 
     let skeleton = extract_skeleton(&document, &buffers);
     let materials = convert_materials(&document);
+    let animations = match &skeleton {
+        Some(skel) => extract_animations(&document, &buffers, skel),
+        None => Vec::new(),
+    };
+
     
-    Ok((vertices, indices, material_ids, materials, images, skeleton))
+    Ok((vertices, indices, material_ids, materials, images, skeleton, animations))
 }
 
 fn convert_materials(document: &Document) -> Vec<Material> {
@@ -527,6 +536,69 @@ fn extract_skeleton(document: &Document, buffers: &[gltf::buffer::Data]) -> Opti
         .collect();
 
     Some(Skeleton {bones, root_bones})
+}
+
+fn extract_animations(document: &Document, buffers: &[gltf::buffer::Data], skeleton: &Skeleton) -> Vec<AnimationClip> {
+    let node_to_bone: HashMap<usize, usize> = skeleton.bones
+        .iter()
+        .enumerate()
+        .map(|(bone_idx, bone)| (bone.node_index, bone_idx))
+        .collect();
+
+    document.animations().filter_map(|anim| {
+        let mut channels_by_bone: HashMap<usize, AnimationChannel> = HashMap::new();
+        let mut max_time = 0.0f32;
+
+        for channel in anim.channels() {
+            let target_node = channel.target().node().index();
+            let Some(&bone_index) = node_to_bone.get(&target_node) else {
+                continue; // Animates a node that isn't part of this skeleton (e.g. a camera) — skip it
+            };
+
+            let reader = channel.reader(|b| Some(&buffers[b.index()]));
+            let Some(inputs) = reader.read_inputs() else { continue };
+            let times: Vec<f32> = inputs.collect();
+            if let Some(&t) = times.last() {
+                max_time = max_time.max(t);
+            }
+
+            let entry = channels_by_bone.entry(bone_index).or_insert_with(|| AnimationChannel {
+                bone_index,
+                translations: Vec::new(),
+                rotations: Vec::new(),
+                scales: Vec::new(),
+            });
+
+            match reader.read_outputs() {
+                Some(gltf::animation::util::ReadOutputs::Translations(vals)) => {
+                    entry.translations = times.iter().copied()
+                        .zip(vals.map(|v| cgmath::vec3(v[0], v[1], v[2])))
+                        .collect();
+                }
+                Some(gltf::animation::util::ReadOutputs::Rotations(vals)) => {
+                    entry.rotations = times.iter().copied()
+                        .zip(vals.into_f32().map(|r| cgmath::Quaternion::new(r[3], r[0], r[1], r[2])))
+                        .collect();
+                }
+                Some(gltf::animation::util::ReadOutputs::Scales(vals)) => {
+                    entry.scales = times.iter().copied()
+                        .zip(vals.map(|v| cgmath::vec3(v[0], v[1], v[2])))
+                        .collect();
+                }
+                _ => {}
+            }
+        }
+
+        if channels_by_bone.is_empty() {
+            return None;
+        }
+        
+        Some(AnimationClip {
+            name: anim.name().unwrap_or("unnamed_animation").to_string(),
+            duration: max_time,
+            channels: channels_by_bone.into_values().collect(),
+        })
+    }).collect()
 }
 
 

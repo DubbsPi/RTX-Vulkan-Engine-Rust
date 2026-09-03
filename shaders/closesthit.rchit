@@ -89,7 +89,7 @@ void main() {
 
     if (mat.albedo_texture_index >= 0)
         albedo = texture(textures[nonuniformEXT(mat.albedo_texture_index)], uv).rgb;
-    
+
 
     shadowed = true;
     traceRayEXT(

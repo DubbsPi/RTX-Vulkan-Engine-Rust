@@ -186,24 +186,26 @@ impl App {
         let mut scene = Scene::new();
         
         let truck = Scene::load_model_into_memory(
-            "models/gmc-sierra-hd2500/source/gmc.glb",
+            "models/Magazine.glb",
             &instance, &device, &mut data,
         )?;
         let protogen = Scene::load_model_into_memory(
-            "models/Protogen.glb",
+            "models/Xenon_animated.glb",
             &instance, &device, &mut data,
         )?;
 
         scene.add_model_to_scene(&truck);
         scene.add_model_to_scene(&truck);
 
-        scene.scale_model(0, vec3(2.0, 0.5, 1.0));
+        scene.scale_model(1, vec3(5.0, 5.0, 5.0));
+
+        scene.scale_model(0, vec3(20.0, 5.0, 10.0));
         scene.translate_model(0, vec3(3.0, -2.0, 0.0));
 
         scene.add_model_to_scene(&protogen);
         scene.translate_model(2, vec3(-4.0, 0.0, 0.0));
         // End scene setup
-        
+
 
         data.texture_sampler = create_texture_sampler(&device)?;
         info!("Triangles: {}, Vertices: {}", scene.indices.len() / 3, scene.vertices.len());
@@ -708,6 +710,7 @@ impl App {
 
         self.data.images_in_flight[image_index as usize] =
             self.data.in_flight_fences[self.frame];
+        
 
         let now = Instant::now();
         let dt = (now - self.last_frame).as_secs_f32();
@@ -726,7 +729,7 @@ impl App {
         let begin_info = vk::CommandBufferBeginInfo::builder();
         self.device.begin_command_buffer(cmd, &begin_info)?;
 
-        self.update_dynamic_models(cmd, time);
+        self.update_dynamic_models(cmd, dt);
 
         self.update_tlas(cmd, &matrix_updates);
 
@@ -1105,7 +1108,7 @@ impl App {
         updates
     }
 
-    unsafe fn update_dynamic_models(&mut self, cmd: vk::CommandBuffer, time: f32) { unsafe {
+    unsafe fn update_dynamic_models(&mut self, cmd: vk::CommandBuffer, dt: f32) { unsafe {
         for i in 0..self.data.blases.len() {
             let Some(descriptor_set) = self.data.skinning_descriptor_sets[i] else {
                 continue;
@@ -1116,17 +1119,17 @@ impl App {
             // Model updating
             if let Some(mapped) = self.data.joint_matrix_buffers_mapped.get(i).copied() {
                 if !mapped.is_null() {
-                    let joint_count = self.data.joint_counts[i];
-                    let test_joint_index = 1usize.min(joint_count.saturating_sub(1) as usize);
+                    if let Some(skeleton) = &self.scene.model_info[i].skeleton {
+                        self.scene.animations[i].advance(dt);
+                        let joint_matrices = self.scene.animations[i].sample(skeleton);
 
-                    let wiggle = Mat4::from_angle_z(cgmath::Rad((time * 2.0).sin() * 0.5));
-
-                    let offset = test_joint_index * size_of::<Mat4>();
-                    std::ptr::copy_nonoverlapping(
-                        (&wiggle as *const Mat4).cast::<u8>(),
-                        mapped.add(offset),
-                        size_of::<Mat4>(),
-                    );
+                        let size = size_of::<Mat4>() * joint_matrices.len();
+                        std::ptr::copy_nonoverlapping(
+                            joint_matrices.as_ptr().cast::<u8>(),
+                            mapped,
+                            size,
+                        );
+                    }
                 }
             }
 
@@ -3298,6 +3301,12 @@ fn main() -> Result<()> {
                     winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::KeyD) => app.input.right = pressed,
                     winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::Space) => app.input.up = pressed,
                     winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::ControlLeft) => app.input.down = pressed,
+
+                    winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::KeyP) => {
+                        if pressed {
+                            app.scene.animations[2].play("Chop_Tree RT.001");
+                        }
+                    },
 
                     winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::Escape) => {
                         if pressed {
