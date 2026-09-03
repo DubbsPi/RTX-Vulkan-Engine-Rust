@@ -23,6 +23,8 @@ use crate::Vertex;
 use crate::Material;
 use crate::Vec3;
 use crate::Mat4;
+use crate::common::Skeleton;
+use crate::common::Bone;
 
 
 pub struct UintRange {
@@ -35,11 +37,12 @@ pub struct ModelInfo {
     pub model_vertex_range: UintRange,
     pub model_index_range: UintRange,
     pub model_material_mappings: Vec<u32>,
+    pub skeleton: Option<Skeleton>,
 }
 
 impl ModelInfo {
     fn new() -> Self {
-        Self {model_vertex_range: UintRange {min: 0, max: 0}, model_index_range: UintRange {min: 0, max: 0}, model_material_mappings: Vec::new()}
+        Self {model_vertex_range: UintRange {min: 0, max: 0}, model_index_range: UintRange {min: 0, max: 0}, model_material_mappings: Vec::new(), skeleton: None}
     }
 }
 
@@ -49,6 +52,8 @@ pub struct Model {
     indices: Vec<u32>,
     material_ids: Vec<u32>,
     materials: Vec<Material>,
+
+    skeleton: Option<Skeleton>,
 }
 
 
@@ -71,10 +76,10 @@ impl Scene {
     }
 
     pub unsafe fn load_model_into_memory(path: &str, instance: &crate::Instance, device: &crate::Device, data: &mut crate::AppData) -> Result<Model> {
-        let (vertices, indices, material_ids, mut materials, images) = load_gltf(path)?;
+        let (vertices, indices, material_ids, mut materials, images, skeleton) = load_gltf(path)?;
 
         unsafe {
-            let texture_offset = data.textures.len() as i32; // capture BEFORE extending
+            let texture_offset = data.textures.len() as i32;
             let result = create_gltf_textures(instance, device, data, &images)?;
             data.textures.extend(result);
 
@@ -86,7 +91,7 @@ impl Scene {
         }
         
         info!("Loaded {} into memory", path);
-        Ok(Model {vertices, indices, material_ids, materials})
+        Ok(Model {vertices, indices, material_ids, materials, skeleton})
     }
 
     pub fn add_model_to_scene(&mut self, model: &Model) {
@@ -128,7 +133,7 @@ impl Scene {
                     material_mapping[model_material_id as usize]
                 })
         );
-
+        
         // Save model info
         self.model_info.push(ModelInfo {
             model_vertex_range: UintRange {
@@ -142,6 +147,8 @@ impl Scene {
             },
 
             model_material_mappings: material_mapping,
+
+            skeleton: model.skeleton.clone(),
         });
     }
 
@@ -159,7 +166,7 @@ impl Scene {
 }
 
 
-fn load_gltf(path: &str) -> Result<(Vec<Vertex>, Vec<u32>, Vec<u32>, Vec<Material>, Vec<Data>)> {
+fn load_gltf(path: &str) -> Result<(Vec<Vertex>, Vec<u32>, Vec<u32>, Vec<Material>,Vec<Data>, Option<Skeleton>,)> {
     let (document, buffers, images) = gltf::import(path)?;
 
     let mut vertices = Vec::new();
@@ -181,7 +188,7 @@ fn load_gltf(path: &str) -> Result<(Vec<Vertex>, Vec<u32>, Vec<u32>, Vec<Materia
                 .map(|p| vec3(p[0], p[1], p[2]))
                 .collect();
 
-            let normals: Vec<Vec3> = match reader.read_normals() {
+            let normals = match reader.read_normals() {
                 Some(iter) => iter.map(|n| vec3(n[0], n[1], n[2])).collect(),
                 None => {
                     // Fall back to flat shading
@@ -201,12 +208,25 @@ fn load_gltf(path: &str) -> Result<(Vec<Vertex>, Vec<u32>, Vec<u32>, Vec<Materia
                 None => vec![None; positions.len()],
             };
 
+            let joint_indices: Vec<[u16; 4]> = match reader.read_joints(0) {
+                Some(read_joints) => read_joints.into_u16().collect(),
+                None => vec![[0, 0, 0, 0]; positions.len()],
+            };
+
+            let joint_weights: Vec<[f32; 4]> = match reader.read_weights(0) {
+                Some(read_weights) => read_weights.into_f32().collect(),
+                None => vec![[0.0, 0.0, 0.0, 0.0]; positions.len()],
+            };
+
+
             let vertex_offset = vertices.len() as u32;
             vertices.extend(
                 positions.iter()
                     .zip(normals.iter())
                     .zip(uvs.iter())
-                    .map(|((&p, &n), &uv)| Vertex::new(p, n, uv)),
+                    .zip(joint_indices.iter())
+                    .zip(joint_weights.iter())
+                    .map(|((((&p, &n), &uv), &ji), &jw)| Vertex::new(p, n, uv, Some(ji), Some(jw))),
             );
 
             let prim_indices: Vec<u32> = match reader.read_indices() {
@@ -222,9 +242,11 @@ fn load_gltf(path: &str) -> Result<(Vec<Vertex>, Vec<u32>, Vec<u32>, Vec<Materia
         }
     }
 
-    let materials = convert_materials(&document);
 
-    Ok((vertices, indices, material_ids, materials, images))
+    let skeleton = extract_skeleton(&document, &buffers);
+    let materials = convert_materials(&document);
+    
+    Ok((vertices, indices, material_ids, materials, images, skeleton))
 }
 
 fn convert_materials(document: &Document) -> Vec<Material> {
@@ -456,6 +478,56 @@ unsafe fn create_texture_image(
 
     Ok((image, memory, view))
 }}
+
+fn extract_skeleton(document: &Document, buffers: &[gltf::buffer::Data]) -> Option<Skeleton> {
+    let skin = document.skins().next()?;
+    let reader = skin.reader(|buffer| Some(&buffers[buffer.index()]));
+
+    let inverse_bind_matrices: Vec<Mat4> = match reader.read_inverse_bind_matrices() {
+        Some(iter) => iter.map(|m| Mat4::from(m)).collect(),
+        None => vec![Mat4::identity(); skin.joints().count()],
+    };
+
+    let joint_nodes: Vec<gltf::Node> = skin.joints().collect();
+
+    let node_to_bone: HashMap<usize, usize> = joint_nodes
+        .iter()
+        .enumerate()
+        .map(|(bone_index, node)| (node.index(), bone_index))
+        .collect();
+
+    let bones: Vec<Bone> = joint_nodes
+        .iter()
+        .enumerate()
+        .map(|(bone_idx, node)| {
+            let (translation, rotation, scale) = node.transform().decomposed();
+            let local_transform =
+                Mat4::from_translation(vec3(translation[0], translation[1], translation[2]))
+                    * Mat4::from(cgmath::Quaternion::new(rotation[3], rotation[0], rotation[1], rotation[2]))
+                    * Mat4::from_nonuniform_scale(scale[0], scale[1], scale[2]);
+
+            let children: Vec<usize> = node.children()
+                .filter_map(|child| node_to_bone.get(&child.index()).copied())
+                .collect();
+
+            Bone {
+                node_index: node.index(),
+                name: node.name().unwrap_or("unnamed_bone").to_string(),
+                children,
+                local_transform,
+                inverse_bind_matrix: inverse_bind_matrices[bone_idx],
+            }
+        })
+        .collect();
+
+    let child_set: std::collections::HashSet<usize> =
+        bones.iter().flat_map(|b| b.children.iter().copied()).collect();
+    let root_bones: Vec<usize> = (0..bones.len())
+        .filter(|i| !child_set.contains(i))
+        .collect();
+
+    Some(Skeleton {bones, root_bones})
+}
 
 
 impl PartialEq for Material {

@@ -1,0 +1,43 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+
+#include "common.glsl"
+
+
+layout(local_size_x = 128) in;
+
+
+layout(scalar, binding = 0) readonly buffer RestVertices {Vertex rest[];};
+layout(scalar, binding = 1) writeonly buffer SkinnedVertices {Vertex skinned[];};
+layout(scalar, binding = 2) readonly buffer JointMatrices {mat4 joints[];};
+
+layout(push_constant) uniform PushConstants {uint vertexCount;} pc;
+
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.vertexCount) return;
+
+    Vertex v = rest[i];
+
+    mat4 skinMatrix =
+        float(v.jw[0]) * joints[uint(v.ji[0])] +
+        float(v.jw[1]) * joints[uint(v.ji[1])] +
+        float(v.jw[2]) * joints[uint(v.ji[2])] +
+        float(v.jw[3]) * joints[uint(v.ji[3])];
+    
+
+    float weightSum = v.jw[0] + v.jw[1] + v.jw[2] + v.jw[3];
+    if (weightSum < 0.0001) {
+        skinned[i] = v;
+        return;
+    }
+
+    Vertex outV;
+    outV.p = (skinMatrix * vec4(v.p, 1.0)).xyz;
+    outV.n = normalize(mat3(skinMatrix) * v.n);
+    outV.uv = v.uv;
+    outV.ji = v.ji;
+    outV.jw = v.jw;
+    skinned[i] = outV;
+}

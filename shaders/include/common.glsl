@@ -6,6 +6,8 @@
 #extension GL_EXT_scalar_block_layout : require
 #extension GL_EXT_ray_tracing : require
 #extension GL_EXT_nonuniform_qualifier : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_16bit_storage : require
 
 
 const vec3 sunLightDir = normalize(vec3(-0.4, 1, 0.2));
@@ -24,9 +26,11 @@ const float hm = 1200.0;
 
 
 struct Vertex {
-    vec3 v;
+    vec3 p;
     vec3 n;
     vec2 uv;
+    uint16_t ji[4];
+    float jw[4];
 };
 
 
@@ -42,7 +46,7 @@ struct ObjectDesc {
     uint64_t vertexAddress;
     uint64_t indexAddress;
     uint materialId;
-    uint pad;
+    uint primitiveOffset;
 };
 
 struct Material {

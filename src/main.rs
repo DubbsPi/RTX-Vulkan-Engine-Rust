@@ -59,6 +59,8 @@ const DEVICE_EXTENSIONS: &[vk::ExtensionName] = &[
 
 const MAX_FRAMES_IN_FLIGHT: usize = 3;
 
+const BLAS_REBUILD_INTERVAL: u32 = 240;
+
 
 #[derive(Copy, Clone, Debug)]
 struct QueueFamilyIndices {
@@ -179,6 +181,7 @@ impl App {
         create_command_pool(&instance, &device, &mut data)?;
         create_storage_image(&instance, &device, &mut data)?;
 
+
         // Scene setup
         let mut scene = Scene::new();
         
@@ -186,16 +189,24 @@ impl App {
             "models/gmc-sierra-hd2500/source/gmc.glb",
             &instance, &device, &mut data,
         )?;
+        let protogen = Scene::load_model_into_memory(
+            "models/Protogen.glb",
+            &instance, &device, &mut data,
+        )?;
+
         scene.add_model_to_scene(&truck);
         scene.add_model_to_scene(&truck);
 
         scene.scale_model(0, vec3(2.0, 0.5, 1.0));
         scene.translate_model(0, vec3(3.0, -2.0, 0.0));
 
+        scene.add_model_to_scene(&protogen);
+        scene.translate_model(2, vec3(-4.0, 0.0, 0.0));
+        // End scene setup
         
+
         data.texture_sampler = create_texture_sampler(&device)?;
         info!("Triangles: {}, Vertices: {}", scene.indices.len() / 3, scene.vertices.len());
-        // End scene setup
 
         create_descriptor_set_layout(&device, &mut data)?;
         create_rt_pipeline(&device, &mut data)?;
@@ -205,7 +216,8 @@ impl App {
         let (vertex_buffer, vertex_buffer_memory) = create_buffer(
             &instance, &device, &data, vertex_size,
             vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
-                | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR,
+                | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR
+                | vk::BufferUsageFlags::STORAGE_BUFFER,
             vk::MemoryPropertyFlags::HOST_COHERENT | vk::MemoryPropertyFlags::HOST_VISIBLE,
         )?;
         let mem = device.map_memory(vertex_buffer_memory, 0, vertex_size, vk::MemoryMapFlags::empty())?;
@@ -239,11 +251,39 @@ impl App {
         let mut blases = Vec::new();
         let mut blases_buffer = Vec::new();
         let mut blases_buffer_memory = Vec::new();
-        for model in &scene.model_info {
-            let (blas, buffer, memory) = create_blas_for_model(&instance, &device, &mut data, vertex_address, index_address, &model.model_vertex_range, &model.model_index_range)?;
+        for model in scene.model_info.iter() {
+            let (blas, buffer, memory, size_info) = create_blas_for_model(&instance, &device, &mut data, vertex_address, index_address, &model.model_vertex_range, &model.model_index_range)?;
             blases.push(blas);
             blases_buffer.push(buffer);
             blases_buffer_memory.push(memory);
+
+            // Skinning
+            if let Some(_) = &model.skeleton {
+                let triangle_count = (model.model_index_range.max - model.model_index_range.min) / 3;
+
+                let scratch_size = size_info.build_scratch_size.max(size_info.update_scratch_size);
+
+                let (scratch_buffer, scratch_memory) = create_buffer(
+                    &instance, &device, &data, scratch_size,
+                    vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+                    vk::MemoryPropertyFlags::DEVICE_LOCAL,
+                )?;
+                let scratch_addr = get_buffer_device_address(&device, scratch_buffer);
+
+                data.skinned_triangle_counts.push(triangle_count);
+                data.skinned_vertex_range_mins.push(model.model_vertex_range.min);
+                data.skinned_index_range_mins.push(model.model_index_range.min);
+                data.blas_scratch_addrs.push(Some(scratch_addr));
+                data.blas_scratch_buffers.push(Some(scratch_buffer));
+                data.blas_scratch_buffers_memory.push(Some(scratch_memory));
+            } else {
+                data.skinned_triangle_counts.push(0);
+                data.skinned_vertex_range_mins.push(0);
+                data.skinned_index_range_mins.push(0);
+                data.blas_scratch_addrs.push(None);
+                data.blas_scratch_buffers.push(None);
+                data.blas_scratch_buffers_memory.push(None);
+            }
         }
 
         data.blases = blases;
@@ -259,10 +299,195 @@ impl App {
             &scene.model_info,
             vertex_address, index_address,
         )?;
-
+        
         create_uniform_buffers(&instance, &device, &mut data)?;
         create_descriptor_pool(&device, &mut data)?;
         create_descriptor_sets(&device, &mut data)?;
+
+
+        let rigged_model_count = scene.model_info
+            .iter()
+            .filter(|m| m.skeleton.is_some())
+            .count() as u32;
+
+        create_skinning_descriptor_pool(&device, &mut data, rigged_model_count)?;
+        create_skinning_pipeline(&device, &mut data)?;
+        
+        let mut skinned_vertex_buffers = Vec::new();
+        let mut skinned_vertex_buffers_memory = Vec::new();
+        let mut joint_matrix_buffers = Vec::new();
+        let mut joint_matrix_buffers_memory = Vec::new();
+        let mut joint_matrix_buffers_mapped: Vec<*mut u8> = Vec::new();
+        let mut skinning_descriptor_sets = Vec::new();
+        let mut skinned_vertex_counts = Vec::new();
+        let mut joint_counts = Vec::new();
+
+        for model_info in &scene.model_info {
+            match &model_info.skeleton {
+                Some(skeleton) => {
+                    let vertex_count = model_info.model_vertex_range.max - model_info.model_vertex_range.min;
+
+                    // Skinned output buffer
+                    let skinned_size = (size_of::<Vertex>() as u32 * vertex_count) as u64;
+                    let (skinned_buffer, skinned_memory) = create_buffer(
+                        &instance, &device, &data, skinned_size,
+                        vk::BufferUsageFlags::STORAGE_BUFFER
+                            | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
+                            | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR,
+                        vk::MemoryPropertyFlags::DEVICE_LOCAL,
+                    )?;
+
+                    // Joint matrix buffer
+                    let joint_count = skeleton.bones.len();
+                    let joint_buffer_size = (size_of::<Mat4>() * joint_count.max(1)) as u64;
+                    let (joint_buffer, joint_memory) = create_buffer(
+                        &instance, &device, &data, joint_buffer_size,
+                        vk::BufferUsageFlags::STORAGE_BUFFER,
+                        vk::MemoryPropertyFlags::HOST_COHERENT | vk::MemoryPropertyFlags::HOST_VISIBLE,
+                    )?;
+                    let joint_mapped = device.map_memory(joint_memory, 0, joint_buffer_size, vk::MemoryMapFlags::empty())?
+                        as *mut u8;
+
+                    
+                    let alloc_info = vk::DescriptorSetAllocateInfo::builder()
+                        .descriptor_pool(data.skinning_descriptor_pool)
+                        .set_layouts(std::slice::from_ref(&data.skinning_descriptor_set_layout));
+                    let descriptor_set = device.allocate_descriptor_sets(&alloc_info)?[0];
+
+                    let rest_info = vk::DescriptorBufferInfo::builder()
+                        .buffer(vertex_buffer) // your shared merged vertex buffer, local var from earlier in create()
+                        .offset((model_info.model_vertex_range.min as u64) * size_of::<Vertex>() as u64)
+                        .range((vertex_count as u64) * size_of::<Vertex>() as u64)
+                        .build();
+                    let skinned_info = vk::DescriptorBufferInfo::builder()
+                        .buffer(skinned_buffer).offset(0).range(vk::WHOLE_SIZE).build();
+                    let joints_info = vk::DescriptorBufferInfo::builder()
+                        .buffer(joint_buffer).offset(0).range(vk::WHOLE_SIZE).build();
+
+                    let writes = &[
+                        vk::WriteDescriptorSet::builder()
+                            .dst_set(descriptor_set).dst_binding(0).dst_array_element(0)
+                            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                            .buffer_info(std::slice::from_ref(&rest_info)).build(),
+                        vk::WriteDescriptorSet::builder()
+                            .dst_set(descriptor_set).dst_binding(1).dst_array_element(0)
+                            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                            .buffer_info(std::slice::from_ref(&skinned_info)).build(),
+                        vk::WriteDescriptorSet::builder()
+                            .dst_set(descriptor_set).dst_binding(2).dst_array_element(0)
+                            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                            .buffer_info(std::slice::from_ref(&joints_info)).build(),
+                    ];
+                    device.update_descriptor_sets(writes, &[] as &[vk::CopyDescriptorSet]);
+
+                    // Blank matrices for the default
+                    let identity_matrices = vec![Mat4::identity(); joint_count.max(1)];
+                    memcpy(identity_matrices.as_ptr().cast::<u8>(), joint_mapped, joint_buffer_size as usize);
+
+                    skinned_vertex_buffers.push(Some(skinned_buffer));
+                    skinned_vertex_buffers_memory.push(Some(skinned_memory));
+                    joint_matrix_buffers.push(Some(joint_buffer));
+                    joint_matrix_buffers_memory.push(Some(joint_memory));
+                    joint_matrix_buffers_mapped.push(joint_mapped);
+                    skinning_descriptor_sets.push(Some(descriptor_set));
+                    skinned_vertex_counts.push(vertex_count);
+                    joint_counts.push(skeleton.bones.len());
+                }
+                None => {
+                    // Boneless model
+                    skinned_vertex_buffers.push(None);
+                    skinned_vertex_buffers_memory.push(None);
+                    joint_matrix_buffers.push(None);
+                    joint_matrix_buffers_memory.push(None);
+                    joint_matrix_buffers_mapped.push(std::ptr::null_mut());
+                    skinning_descriptor_sets.push(None);
+                    skinned_vertex_counts.push(0);
+                    joint_counts.push(0);
+                }
+            }
+        }
+
+        data.skinned_vertex_buffers = skinned_vertex_buffers;
+        data.skinned_vertex_buffers_memory = skinned_vertex_buffers_memory;
+        data.joint_matrix_buffers = joint_matrix_buffers;
+        data.joint_matrix_buffers_memory = joint_matrix_buffers_memory;
+        data.joint_matrix_buffers_mapped = joint_matrix_buffers_mapped;
+        data.skinning_descriptor_sets = skinning_descriptor_sets;
+        data.skinned_vertex_counts = skinned_vertex_counts;
+        data.joint_counts = joint_counts;
+
+
+        let mut skinned_index_buffers = Vec::new();
+        let mut skinned_index_buffers_memory = Vec::new();
+        let mut skinned_index_addresses = Vec::new();
+        for model_info in &scene.model_info {
+            if model_info.skeleton.is_some() {
+                let indices: Vec<u32> = scene.indices[model_info.model_index_range.min as usize..model_info.model_index_range.max as usize]
+                    .iter()
+                    .map(|&index| index - model_info.model_vertex_range.min)
+                    .collect();
+                let index_size = (size_of::<u32>() * indices.len()) as u64;
+                let (index_buffer, index_memory) = create_buffer(
+                    &instance, &device, &data, index_size,
+                    vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
+                        | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR,
+                    vk::MemoryPropertyFlags::HOST_COHERENT | vk::MemoryPropertyFlags::HOST_VISIBLE,
+                )?;
+                let mapped = device.map_memory(index_memory, 0, index_size, vk::MemoryMapFlags::empty())?;
+                memcpy(indices.as_ptr().cast::<u8>(), mapped.cast::<u8>(), index_size as usize);
+                device.unmap_memory(index_memory);
+
+                skinned_index_addresses.push(Some(get_buffer_device_address(&device, index_buffer)));
+                skinned_index_buffers.push(Some(index_buffer));
+                skinned_index_buffers_memory.push(Some(index_memory));
+            } else {
+                skinned_index_addresses.push(None);
+                skinned_index_buffers.push(None);
+                skinned_index_buffers_memory.push(None);
+            }
+        }
+        data.skinned_index_buffers = skinned_index_buffers;
+        data.skinned_index_buffers_memory = skinned_index_buffers_memory;
+        data.skinned_index_addresses = skinned_index_addresses;
+
+        let mut object_descs = Vec::with_capacity(scene.model_info.len());
+        for (model_index, model_info) in scene.model_info.iter().enumerate() {
+            let (vertex_address, index_address) = if model_info.skeleton.is_some() {
+                (
+                    get_buffer_device_address(&device, data.skinned_vertex_buffers[model_index].unwrap()),
+                    data.skinned_index_addresses[model_index].unwrap(),
+                )
+            } else {
+                (
+                    vertex_address,
+                    index_address + model_info.model_index_range.min as u64 * size_of::<u32>() as u64,
+                )
+            };
+            object_descs.push(ObjectDesc {
+                vertex_address,
+                index_address,
+                material_id: model_info.model_index_range.min / 3,
+                _pad: 0,
+            });
+        }
+        let object_descs_size = (size_of::<ObjectDesc>() * object_descs.len()) as u64;
+        let mapped = device.map_memory(data.object_descs_buffer_memory, 0, object_descs_size, vk::MemoryMapFlags::empty())?;
+        memcpy(object_descs.as_ptr().cast::<u8>(), mapped.cast::<u8>(), object_descs_size as usize);
+        device.unmap_memory(data.object_descs_buffer_memory);
+
+
+        let mut blas_frames_since_rebuild = Vec::new();
+        let mut rigged_index = 0u32;
+        for model in &scene.model_info {
+            if model.skeleton.is_some() {
+                blas_frames_since_rebuild.push((rigged_index * 37) % BLAS_REBUILD_INTERVAL);
+                rigged_index += 1;
+            } else {
+                blas_frames_since_rebuild.push(0);
+            }
+        }
+        data.blas_frames_since_rebuild = blas_frames_since_rebuild;
+
 
         create_shader_binding_table(&instance, &device, &mut data)?;
 
@@ -342,6 +567,38 @@ impl App {
             self.device.free_memory(memory, None);
         }
 
+        // Rigging
+        for i in 0..self.data.skinned_vertex_buffers.len() {
+            if let Some(buffer) = self.data.skinned_vertex_buffers[i] {
+                self.device.destroy_buffer(buffer, None);
+            }
+            if let Some(memory) = self.data.skinned_vertex_buffers_memory[i] {
+                self.device.free_memory(memory, None);
+            }
+
+            if let Some(buffer) = self.data.joint_matrix_buffers[i] {
+                self.device.destroy_buffer(buffer, None);
+            }
+            if let Some(memory) = self.data.joint_matrix_buffers_memory[i] {
+                // unmap before freeing — it was left persistently mapped
+                self.device.unmap_memory(memory);
+                self.device.free_memory(memory, None);
+            }
+
+            if let Some(buffer) = self.data.skinned_index_buffers[i] {
+                self.device.destroy_buffer(buffer, None);
+            }
+            if let Some(memory) = self.data.skinned_index_buffers_memory[i] {
+                self.device.free_memory(memory, None);
+            }
+        }
+
+        // Skinning
+        self.device.destroy_pipeline(self.data.skinning_pipeline, None);
+        self.device.destroy_pipeline_layout(self.data.skinning_pipeline_layout, None);
+        self.device.destroy_descriptor_set_layout(self.data.skinning_descriptor_set_layout, None);
+                
+
         // Pools and descriptor sets
         self.device.destroy_query_pool(self.data.timestamp_query_pool, None);
         self.device.destroy_descriptor_set_layout(self.data.descriptor_set_layout, None);
@@ -374,6 +631,7 @@ impl App {
             self.device.destroy_image(self.data.storage_images[i], None);
             self.device.free_memory(self.data.storage_image_memories[i], None);
         }
+
 
         self.device.destroy_pipeline(self.data.rt_pipeline, None);
         self.device.destroy_pipeline_layout(self.data.rt_pipeline_layout, None);
@@ -467,6 +725,8 @@ impl App {
 
         let begin_info = vk::CommandBufferBeginInfo::builder();
         self.device.begin_command_buffer(cmd, &begin_info)?;
+
+        self.update_dynamic_models(cmd, time);
 
         self.update_tlas(cmd, &matrix_updates);
 
@@ -844,6 +1104,134 @@ impl App {
 
         updates
     }
+
+    unsafe fn update_dynamic_models(&mut self, cmd: vk::CommandBuffer, time: f32) { unsafe {
+        for i in 0..self.data.blases.len() {
+            let Some(descriptor_set) = self.data.skinning_descriptor_sets[i] else {
+                continue;
+            };
+
+            let vertex_count = self.data.skinned_vertex_counts[i];
+
+            // Model updating
+            if let Some(mapped) = self.data.joint_matrix_buffers_mapped.get(i).copied() {
+                if !mapped.is_null() {
+                    let joint_count = self.data.joint_counts[i];
+                    let test_joint_index = 1usize.min(joint_count.saturating_sub(1) as usize);
+
+                    let wiggle = Mat4::from_angle_z(cgmath::Rad((time * 2.0).sin() * 0.5));
+
+                    let offset = test_joint_index * size_of::<Mat4>();
+                    std::ptr::copy_nonoverlapping(
+                        (&wiggle as *const Mat4).cast::<u8>(),
+                        mapped.add(offset),
+                        size_of::<Mat4>(),
+                    );
+                }
+            }
+
+            // Skinning compute
+            self.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.data.skinning_pipeline);
+            self.device.cmd_bind_descriptor_sets(
+                cmd, vk::PipelineBindPoint::COMPUTE, self.data.skinning_pipeline_layout,
+                0, &[descriptor_set], &[],
+            );
+            self.device.cmd_push_constants(
+                cmd, self.data.skinning_pipeline_layout, vk::ShaderStageFlags::COMPUTE,
+                0, &vertex_count.to_ne_bytes(),
+            );
+            self.device.cmd_dispatch(cmd, (vertex_count + 127) / 128, 1, 1);
+
+            // Wait for compute
+            let compute_barrier = vk::MemoryBarrier::builder()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::ACCELERATION_STRUCTURE_WRITE_KHR);
+            self.device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::ACCELERATION_STRUCTURE_BUILD_KHR,
+                vk::DependencyFlags::empty(),
+                &[compute_barrier],
+                &[] as &[vk::BufferMemoryBarrier],
+                &[] as &[vk::ImageMemoryBarrier],
+            );
+
+            // Decide to rebuild or not
+            let due_for_rebuild = self.data.blas_frames_since_rebuild[i] >= BLAS_REBUILD_INTERVAL;
+            let mode = if due_for_rebuild {
+                vk::BuildAccelerationStructureModeKHR::BUILD
+            } else {
+                vk::BuildAccelerationStructureModeKHR::UPDATE
+            };
+
+            self.rebuild_or_refit_blas(cmd, i, mode);
+
+            self.data.blas_frames_since_rebuild[i] = if due_for_rebuild {
+                0
+            } else {
+                self.data.blas_frames_since_rebuild[i] + 1
+            };
+        }}
+
+
+        let as_barrier = vk::MemoryBarrier::builder()
+            .src_access_mask(vk::AccessFlags::ACCELERATION_STRUCTURE_WRITE_KHR)
+            .dst_access_mask(vk::AccessFlags::ACCELERATION_STRUCTURE_READ_KHR);
+        unsafe {
+            self.device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::ACCELERATION_STRUCTURE_BUILD_KHR,
+                vk::PipelineStageFlags::RAY_TRACING_SHADER_KHR,
+                vk::DependencyFlags::empty(),
+                &[as_barrier],
+                &[] as &[vk::BufferMemoryBarrier],
+                &[] as &[vk::ImageMemoryBarrier],
+            );
+        }
+    }
+
+    unsafe fn rebuild_or_refit_blas(&mut self, cmd: vk::CommandBuffer, model_index: usize, mode: vk::BuildAccelerationStructureModeKHR) { unsafe {
+        let blas = self.data.blases[model_index];
+        let skinned_buffer = self.data.skinned_vertex_buffers[model_index].unwrap();
+        let vertex_count = self.data.skinned_vertex_counts[model_index];
+        let triangle_count = self.data.skinned_triangle_counts[model_index];
+        let skinned_address = get_buffer_device_address(&self.device, skinned_buffer);
+        let index_address = self.data.skinned_index_addresses[model_index].unwrap();
+
+        let triangles_data = vk::AccelerationStructureGeometryTrianglesDataKHR::builder()
+            .vertex_format(vk::Format::R32G32B32_SFLOAT)
+            .vertex_data(vk::DeviceOrHostAddressConstKHR {device_address: skinned_address})
+            .vertex_stride(size_of::<Vertex>() as u64)
+            .max_vertex(vertex_count - 1)
+            .index_type(vk::IndexType::UINT32)
+            .index_data(vk::DeviceOrHostAddressConstKHR {device_address: index_address})
+            .build();
+
+        let geometry = vk::AccelerationStructureGeometryKHR::builder()
+            .geometry_type(vk::GeometryTypeKHR::TRIANGLES)
+            .geometry(vk::AccelerationStructureGeometryDataKHR { triangles: triangles_data })
+            .flags(vk::GeometryFlagsKHR::OPAQUE)
+            .build();
+        let geometries = &[geometry];
+
+        let build_info = vk::AccelerationStructureBuildGeometryInfoKHR::builder()
+            .type_(vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL)
+            .flags(vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE | vk::BuildAccelerationStructureFlagsKHR::ALLOW_UPDATE)
+            .mode(mode)
+            .src_acceleration_structure(blas)
+            .dst_acceleration_structure(blas)
+            .geometries(geometries)
+            .scratch_data(vk::DeviceOrHostAddressKHR {device_address: self.data.blas_scratch_addrs[model_index].unwrap()});
+
+        let range_info = vk::AccelerationStructureBuildRangeInfoKHR::builder()
+            .primitive_count(triangle_count)
+            .primitive_offset(0)
+            .first_vertex(0)
+            .transform_offset(0)
+            .build();
+
+        self.device.cmd_build_acceleration_structures_khr(cmd, &[build_info], &[&[range_info]]);
+    }}
 }
 
 
@@ -886,6 +1274,35 @@ struct AppData {
     textures: Vec<(vk::Image, vk::DeviceMemory, vk::ImageView)>,
     texture_sampler: vk::Sampler,
 
+    // Rigging
+    skinned_vertex_buffers: Vec<Option<vk::Buffer>>,
+    skinned_vertex_buffers_memory: Vec<Option<vk::DeviceMemory>>,
+    joint_matrix_buffers: Vec<Option<vk::Buffer>>,
+    joint_matrix_buffers_memory: Vec<Option<vk::DeviceMemory>>,
+    joint_matrix_buffers_mapped: Vec<*mut u8>,
+    skinning_descriptor_sets: Vec<Option<vk::DescriptorSet>>,
+    skinned_vertex_counts: Vec<u32>,
+    skinned_index_buffers: Vec<Option<vk::Buffer>>,
+    skinned_index_buffers_memory: Vec<Option<vk::DeviceMemory>>,
+    skinned_index_addresses: Vec<Option<vk::DeviceAddress>>,
+
+    // Skinning
+    skinning_descriptor_pool: vk::DescriptorPool,
+    skinned_triangle_counts: Vec<u32>,
+    skinned_index_range_mins: Vec<u32>,
+    skinned_vertex_range_mins: Vec<u32>,
+    blas_scratch_addrs: Vec<Option<vk::DeviceAddress>>,
+    blas_scratch_buffers: Vec<Option<vk::Buffer>>,
+    blas_scratch_buffers_memory: Vec<Option<vk::DeviceMemory>>,
+
+    // Rigged updates
+    blas_frames_since_rebuild: Vec<u32>,
+
+    // Skinning
+    skinning_pipeline: vk::Pipeline,
+    skinning_pipeline_layout: vk::PipelineLayout,
+    skinning_descriptor_set_layout: vk::DescriptorSetLayout,
+
     // Blas
     blases: Vec<vk::AccelerationStructureKHR>,
     blases_buffer: Vec<vk::Buffer>,
@@ -903,6 +1320,8 @@ struct AppData {
     instance_buffer_mapped: *mut u8,
     instance_buffer_addr: vk::DeviceAddress,
     instance_count: u32,
+    joint_counts: Vec<usize>,
+    
 
     // Descriptors
     descriptor_set_layout: vk::DescriptorSetLayout,
@@ -1336,8 +1755,12 @@ unsafe fn create_logical_device(
         .shader_sampled_image_array_non_uniform_indexing(true)
         .runtime_descriptor_array(true);
 
+    let mut int16_features = vk::PhysicalDevice16BitStorageFeatures::builder()
+        .storage_buffer_16bit_access(true);
+
     let base_features = vk::PhysicalDeviceFeatures::builder()
-        .shader_int64(true);
+        .shader_int64(true)
+        .shader_int16(true);
     
     let mut features2 = vk::PhysicalDeviceFeatures2::builder()
         .features(base_features)
@@ -1346,7 +1769,8 @@ unsafe fn create_logical_device(
         .push_next(&mut bda_features)
         .push_next(&mut dynamic_rendering_features)
         .push_next(&mut scalar_block_layout_features)
-        .push_next(&mut descriptor_indexing_features);
+        .push_next(&mut descriptor_indexing_features)
+        .push_next(&mut int16_features);
 
     instance.get_physical_device_features2(data.physical_device, &mut features2);
 
@@ -1487,7 +1911,7 @@ unsafe fn create_command_pool(
     let indices = QueueFamilyIndices::get(instance, data, data.physical_device)?;
 
     let info = vk::CommandPoolCreateInfo::builder()
-        .flags(vk::CommandPoolCreateFlags::empty())
+        .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
         .queue_family_index(indices.graphics);
 
     data.command_pool = device.create_command_pool(&info, None)?;
@@ -1921,10 +2345,10 @@ unsafe fn create_scene_buffers(
     // ObjectDesc buffer
     let object_descs: Vec<ObjectDesc> = model_info
         .iter()
-        .map(|_model| ObjectDesc {
-            vertex_address, // no offset — indices are global
-            index_address: index_address + (_model.model_index_range.min as u64 * size_of::<u32>() as u64), // index buffer offset still needed
-            material_id: 0,
+        .map(|model| ObjectDesc {
+            vertex_address,
+            index_address: index_address + (model.model_index_range.min as u64 * size_of::<u32>() as u64),
+            material_id: model.model_index_range.min / 3,
             _pad: 0,
         })
         .collect();
@@ -1972,7 +2396,7 @@ unsafe fn create_blas_for_model(
     index_address: u64,
     vertex_range: &UintRange,
     index_range: &UintRange,
-) -> Result<(vk::AccelerationStructureKHR, vk::Buffer, vk::DeviceMemory)> { unsafe {
+) -> Result<(vk::AccelerationStructureKHR, vk::Buffer, vk::DeviceMemory, vk::AccelerationStructureBuildSizesInfoKHR)> { unsafe {
     let triangle_count = (index_range.max - index_range.min) / 3;
     let model_vertex_count = vertex_range.max - vertex_range.min;
 
@@ -2000,7 +2424,8 @@ unsafe fn create_blas_for_model(
     let geometries = &[geometry];
     let mut build_info = vk::AccelerationStructureBuildGeometryInfoKHR::builder()
         .type_(vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL)
-        .flags(vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE)
+        .flags(vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE
+            | vk::BuildAccelerationStructureFlagsKHR::ALLOW_UPDATE)
         .mode(vk::BuildAccelerationStructureModeKHR::BUILD)
         .geometries(geometries);
 
@@ -2075,8 +2500,8 @@ unsafe fn create_blas_for_model(
     // Cleanup scratch
     device.destroy_buffer(scratch_buffer, None);
     device.free_memory(scratch_buffer_memory, None);
-
-    Ok((blas, as_buffer, as_buffer_memory))
+    
+    Ok((blas, as_buffer, as_buffer_memory, size_info))
 }}
 
 unsafe fn create_tlas(
@@ -2456,6 +2881,60 @@ unsafe fn create_shader_binding_table(
     Ok(())
 }}
 
+unsafe fn create_skinning_pipeline(device: &Device, data: &mut AppData) -> Result<()> { unsafe {
+    let rest_binding = vk::DescriptorSetLayoutBinding::builder()
+        .binding(0)
+        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+        .descriptor_count(1)
+        .stage_flags(vk::ShaderStageFlags::COMPUTE);
+
+    let skinned_binding = vk::DescriptorSetLayoutBinding::builder()
+        .binding(1)
+        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+        .descriptor_count(1)
+        .stage_flags(vk::ShaderStageFlags::COMPUTE);
+
+    let joints_binding = vk::DescriptorSetLayoutBinding::builder()
+        .binding(2)
+        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+        .descriptor_count(1)
+        .stage_flags(vk::ShaderStageFlags::COMPUTE);
+
+    let bindings = &[rest_binding, skinned_binding, joints_binding];
+    let layout_info = vk::DescriptorSetLayoutCreateInfo::builder().bindings(bindings);
+    data.skinning_descriptor_set_layout = device.create_descriptor_set_layout(&layout_info, None)?;
+
+    let push_constant_range = vk::PushConstantRange::builder()
+        .stage_flags(vk::ShaderStageFlags::COMPUTE)
+        .offset(0)
+        .size(size_of::<u32>() as u32);
+
+    let set_layouts = &[data.skinning_descriptor_set_layout];
+    let push_constant_ranges = &[push_constant_range];
+    let pipeline_layout_info = vk::PipelineLayoutCreateInfo::builder()
+        .set_layouts(set_layouts)
+        .push_constant_ranges(push_constant_ranges);
+    data.skinning_pipeline_layout = device.create_pipeline_layout(&pipeline_layout_info, None)?;
+
+    let skin_bytes = include_bytes!("../shaders/skin.spv");
+    let skin_module = create_shader_module(device, &skin_bytes[..])?;
+
+    let stage = vk::PipelineShaderStageCreateInfo::builder()
+        .stage(vk::ShaderStageFlags::COMPUTE)
+        .module(skin_module)
+        .name(b"main\0");
+
+    let pipeline_info = vk::ComputePipelineCreateInfo::builder()
+        .stage(stage)
+        .layout(data.skinning_pipeline_layout);
+
+    let pipelines = device.create_compute_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)?;
+    data.skinning_pipeline = pipelines.0[0];
+
+    device.destroy_shader_module(skin_module, None);
+    Ok(())
+}}
+
 
 // Descriptor creation
 unsafe fn create_descriptor_set_layout(
@@ -2550,8 +3029,8 @@ unsafe fn create_descriptor_pool(device: &Device, data: &mut AppData) -> Result<
         .descriptor_count((data.swapchain_images.len() * 3) as u32);
 
     let textures_size = vk::DescriptorPoolSize::builder()
-    .type_(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-    .descriptor_count((data.swapchain_images.len() * data.textures.len().max(1)) as u32);
+        .type_(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+        .descriptor_count((data.swapchain_images.len() * data.textures.len().max(1)) as u32);
 
 
     let pool_sizes = &[
@@ -2710,6 +3189,19 @@ unsafe fn create_descriptor_sets(device: &Device, data: &mut AppData) -> Result<
         );
     }
 
+    Ok(())
+}}
+
+unsafe fn create_skinning_descriptor_pool(device: &Device, data: &mut AppData, rigged_model_count: u32) -> Result<()> { unsafe {
+    let pool_size = vk::DescriptorPoolSize::builder()
+        .type_(vk::DescriptorType::STORAGE_BUFFER)
+        .descriptor_count(rigged_model_count * 3);
+
+    let info = vk::DescriptorPoolCreateInfo::builder()
+        .pool_sizes(std::slice::from_ref(&pool_size))
+        .max_sets(rigged_model_count.max(1));
+
+    data.skinning_descriptor_pool = device.create_descriptor_pool(&info, None)?;
     Ok(())
 }}
 

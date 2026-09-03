@@ -39,9 +39,9 @@ void main() {
 
     vec3 bary = vec3(1.0 - attribs.x - attribs.y, attribs.x, attribs.y);
 
-    vec3 p0 = vertices.vert[i0].v;
-    vec3 p1 = vertices.vert[i1].v;
-    vec3 p2 = vertices.vert[i2].v;
+    vec3 p0 = vertices.vert[i0].p;
+    vec3 p1 = vertices.vert[i1].p;
+    vec3 p2 = vertices.vert[i2].p;
 
     vec3 hitPos = p0 * bary.x + p1 * bary.y + p2 * bary.z;
     hitPos = (gl_ObjectToWorldEXT * vec4(hitPos, 1.0)).xyz;
@@ -83,7 +83,7 @@ void main() {
     #endif
 
     // Texturing
-    uint materialId = materialIds[gl_PrimitiveID];
+    uint materialId = materialIds[obj.materialId + gl_PrimitiveID];
     Material mat = mats[materialId];
     vec3 albedo = mat.albedo;
 
