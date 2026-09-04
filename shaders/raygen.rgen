@@ -10,6 +10,7 @@ layout(binding = 1, set = 0, rgba8) uniform image2D outputImage;
 layout(binding = 2, set = 0) uniform CameraUBO {
     mat4 viewInverse;
     mat4 projInverse;
+    float time;
 } cam;
 
 
@@ -42,5 +43,14 @@ void main() {
         0
     );
     
+
+    // Aces
+    hitColor = (hitColor * (2.51 * hitColor + 0.03)) / (hitColor * (2.43 * hitColor + 0.59) + 0.14);
+    hitColor = pow(clamp(hitColor, 0.0, 1.0), vec3(1.0 / 2.2));
+
+    // Dithering
+    float dither = bayerDither(gl_LaunchIDEXT.xy);
+    hitColor += dither * 0.00392156862;
+
     imageStore(outputImage, ivec2(gl_LaunchIDEXT.xy), vec4(hitColor, 1.0));
 }

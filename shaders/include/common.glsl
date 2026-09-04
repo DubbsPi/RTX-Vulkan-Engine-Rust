@@ -10,6 +10,10 @@
 #extension GL_EXT_shader_16bit_storage : require
 
 
+#define PI 3.14159265359
+#define TAU 6.28318530718
+
+
 const vec3 sunLightDir = normalize(vec3(-0.4, 1, 0.2));
 
 #define SKY_VIEW_SAMPLES 12
@@ -51,10 +55,21 @@ struct ObjectDesc {
 
 struct Material {
     vec3 albedo;
-    int albedo_texture_index;
+    int albedoTextureIndex;
     float metallic;
     float roughness;
-    vec2 pad1;
+
+    vec3 emission;
+
+    float transmission;
+    float ior;
+
+    float specular;
+    float clearcoat;
+    float clearcoatRoughness;
+
+    float sheen;
+    vec3 sheenColor;
 };
 
 
@@ -147,5 +162,62 @@ vec3 getSky(in vec3 rayDir, in vec3 sunDir, in float cameraY) {
 
     return skyColor;
 }
+
+
+float bayerDither(in vec2 pixelPos) {
+    int x = int(mod(pixelPos.x, 4.0));
+    int y = int(mod(pixelPos.y, 4.0));
+    
+    int index = x + y * 4;
+    
+    float pattern[16] = float[16](
+        0.0 / 16.0, 8.0 / 16.0, 2.0 / 16.0, 10.0 / 16.0,
+        12.0 / 16.0, 4.0 / 16.0, 14.0 / 16.0, 6.0 / 16.0,
+        3.0 / 16.0, 11.0 / 16.0, 1.0 / 16.0, 9.0 / 16.0,
+        15.0 / 16.0, 7.0 / 16.0, 13.0 / 16.0, 5.0 / 16.0
+    );
+    
+    return pattern[index] - 0.5;
+}
+
+
+vec3 cookTorrance(in float roughness, in vec3 F0, in float NdotV, in float NdotL, in float NdotH, in float VdotH, out vec3 F) {
+    // Fresnel
+    F = F0 + (1.0 - F0) * pow(1.0 - VdotH, 5.0);
+
+    // Distribution
+    float a = max(roughness, 0.045);
+    a = a * a;
+    float a2 = a * a;
+    float denom = NdotH * NdotH * (a2 - 1.0) + 1.0;
+    float D = a2 / (PI * denom * denom);
+
+    // Geometry
+    float k = (roughness + 1.0) * (roughness + 1.0) / 8.0;
+    float G = (NdotV / (NdotV * (1.0 - k) + k)) * (NdotL / (NdotL * (1.0 - k) + k));
+
+    return (D * G * F) / (4.0 * NdotV * NdotL);
+}
+
+vec3 evalClearcoat(in float clearcoat, in float ccRoughness, in float NdotV, in float NdotL, in float NdotH, in float VdotH) {
+    float a = ccRoughness * ccRoughness;
+    float a2 = a * a;
+    float denom = NdotH * NdotH * (a2 - 1.0) + 1.0;
+    float D = a2 / (PI * denom * denom);
+
+    float Fc = 0.04 + 0.96 * pow(1.0 - VdotH, 5.0);
+    
+    float k = 0.25;
+    float G = (NdotV / (NdotV * (1.0-k)+k)) * (NdotL / (NdotL*(1.0-k)+k));
+
+    float clearcoatSpec = D * Fc * G / max(4.0 * NdotV * NdotL, 1e-4);
+    return vec3(clearcoatSpec * clearcoat);
+}
+
+vec3 evalSheen(in float sheen, in vec3 sheenColor, in float VdotH) {
+    float sheenFresnel = pow(1.0 - VdotH, 5.0);
+    return sheenColor * sheen * sheenFresnel;
+}
+
 
 #endif

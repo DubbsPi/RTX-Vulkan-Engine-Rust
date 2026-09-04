@@ -19,10 +19,10 @@ use vulkanalia::vk::HasBuilder;
 use vulkanalia::vk::Handle;
 
 
-use crate::Vertex;
-use crate::Material;
-use crate::Vec3;
-use crate::Mat4;
+use crate::common::Vertex;
+use crate::common::Material;
+use crate::common::Vec3;
+use crate::common::Mat4;
 use crate::common::Skeleton;
 use crate::common::Bone;
 use crate::common::{AnimationChannel, AnimationClip, AnimationPlayer};
@@ -177,6 +177,7 @@ fn load_gltf(path: &str) -> Result<(Vec<Vertex>, Vec<u32>, Vec<u32>, Vec<Materia
     let mut indices = Vec::new();
     let mut material_ids = Vec::new();
 
+
     for mesh in document.meshes() {
         for primitive in mesh.primitives() {
             if primitive.mode() != gltf::mesh::Mode::Triangles {
@@ -263,19 +264,73 @@ fn convert_materials(document: &Document) -> Vec<Material> {
         .materials()
         .map(|m| {
             let pbr = m.pbr_metallic_roughness();
+            
+            // Albedo
             let base_color = pbr.base_color_factor();
+            let albedo = Vec3::new(base_color[0], base_color[1], base_color[2]);
 
             let albedo_texture_index = pbr
                 .base_color_texture()
-                .map(|info| info.texture().source().index() as i32)
+                .map(|tex| tex.texture().index() as i32)
                 .unwrap_or(-1);
 
+            let metallic = pbr.metallic_factor();
+            let roughness = pbr.roughness_factor();
+
+            // Emission
+            let emissive_factor = m.emissive_factor();
+            let emissive_strength = m
+                .emissive_strength()
+                .unwrap_or(1.0);
+            let emission = Vec3::new(
+                emissive_factor[0] * emissive_strength,
+                emissive_factor[1] * emissive_strength,
+                emissive_factor[2] * emissive_strength,
+            );
+
+            // Transmission
+            let transmission = m
+                .transmission()
+                .map(|t| t.transmission_factor())
+                .unwrap_or(0.0);
+
+            // Ior
+            let ior = m.ior().unwrap_or(1.5);
+
+            // Specular
+            let specular = m
+                .specular()
+                .map(|s| s.specular_factor())
+                .unwrap_or(1.0);
+
+            // Clearcoat
+            let (clearcoat, clearcoat_roughness) = m
+                .clearcoat()
+                .map(|c| (c.clearcoat_factor(), c.clearcoat_roughness_factor()))
+                .unwrap_or((0.0, 0.0));
+
+            // Sheen
+            let (sheen_color, sheen) = m
+                .sheen()
+                .map(|s| {
+                    let color = s.sheen_color_factor();
+                    (Vec3::new(color[0], color[1], color[2]), 1.0)
+                })
+                .unwrap_or((Vec3::new(0.0, 0.0, 0.0), 0.0));
+
             Material {
-                albedo: vec3(base_color[0], base_color[1], base_color[2]),
+                albedo,
                 albedo_texture_index,
-                metallic: pbr.metallic_factor(),
-                roughness: pbr.roughness_factor(),
-                _pad1: [0.0, 0.0],
+                metallic,
+                roughness,
+                emission,
+                transmission,
+                ior,
+                specular,
+                clearcoat,
+                clearcoat_roughness,
+                sheen,
+                sheen_color,
             }
         })
         .collect()
@@ -550,7 +605,7 @@ fn extract_animations(document: &Document, buffers: &[gltf::buffer::Data], skele
         let mut max_time = 0.0f32;
 
         for channel in anim.channels() {
-            let target_node = channel.target().node().index();
+            let target_node = channel.target().node()?.index();
             let Some(&bone_index) = node_to_bone.get(&target_node) else {
                 continue; // Animates a node that isn't part of this skeleton (e.g. a camera) — skip it
             };

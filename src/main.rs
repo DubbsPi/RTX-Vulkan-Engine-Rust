@@ -190,7 +190,7 @@ impl App {
             &instance, &device, &mut data,
         )?;
         let protogen = Scene::load_model_into_memory(
-            "models/Xenon_animated.glb",
+            "models/Xenon.glb",
             &instance, &device, &mut data,
         )?;
 
@@ -3304,7 +3304,7 @@ fn main() -> Result<()> {
 
                     winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::KeyP) => {
                         if pressed {
-                            app.scene.animations[2].play("Chop_Tree RT.001");
+                            app.scene.animations[2].play("Chop_Tree RT");
                         }
                     },
 

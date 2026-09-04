@@ -41,9 +41,21 @@ impl Vertex {
 pub struct Material {
     pub albedo: Vec3,
     pub albedo_texture_index: i32,
+
     pub metallic: f32,
     pub roughness: f32,
-    pub _pad1: [f32; 2],
+
+    pub emission: Vec3,
+
+    pub transmission: f32,
+    pub ior: f32,
+
+    pub specular: f32,
+    pub clearcoat: f32,
+    pub clearcoat_roughness: f32,
+
+    pub sheen: f32,
+    pub sheen_color: Vec3,
 }
 
 
