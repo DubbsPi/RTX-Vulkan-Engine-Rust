@@ -31,7 +31,9 @@ const float hm = 1200.0;
 
 struct Vertex {
     vec3 p;
+    float pad0;
     vec3 n;
+    float pad1;
     vec2 uv;
     uint16_t ji[4];
     float jw[4];
@@ -199,13 +201,13 @@ vec3 cookTorrance(in float roughness, in vec3 F0, in float NdotV, in float NdotL
     return (D * G * F) / (4.0 * NdotV * NdotL);
 }
 
-vec3 evalClearcoat(in float clearcoat, in float ccRoughness, in float NdotV, in float NdotL, in float NdotH, in float VdotH) {
+vec3 evalClearcoat(in float clearcoat, in float ccRoughness, in float NdotV, in float NdotL, in float NdotH, in float VdotH, out float Fc) {
     float a = ccRoughness * ccRoughness;
     float a2 = a * a;
     float denom = NdotH * NdotH * (a2 - 1.0) + 1.0;
     float D = a2 / (PI * denom * denom);
 
-    float Fc = 0.04 + 0.96 * pow(1.0 - VdotH, 5.0);
+    Fc = 0.04 + 0.96 * pow(1.0 - VdotH, 5.0);
     
     float k = 0.25;
     float G = (NdotV / (NdotV * (1.0-k)+k)) * (NdotL / (NdotL*(1.0-k)+k));
@@ -214,9 +216,20 @@ vec3 evalClearcoat(in float clearcoat, in float ccRoughness, in float NdotV, in 
     return vec3(clearcoatSpec * clearcoat);
 }
 
-vec3 evalSheen(in float sheen, in vec3 sheenColor, in float VdotH) {
-    float sheenFresnel = pow(1.0 - VdotH, 5.0);
-    return sheenColor * sheen * sheenFresnel;
+vec3 evalSheen(in float sheen, in vec3 sheenColor, in float roughness, in float NdotH, in float NdotV, in float NdotL) {
+    float invAlpha = 1.0 / max(roughness, 0.007);
+    float cos2h = NdotH * NdotH;
+    float sin2h = max(1.0 - cos2h, 0.0078125);
+    float D = (2.0 + invAlpha) * pow(sin2h, invAlpha * 0.5) / (2.0 * PI);
+
+    float V = 1.0 / (4.0 * (NdotL + NdotV - NdotL * NdotV));
+
+    return sheenColor * sheen * D * V;
+}
+
+vec3 energyCompensation(in vec3 F0, in float roughness, in float NdotV) {
+    float Ess = 1.0 - pow(1.0 - NdotV, 5.0 - 4.0 * roughness);
+    return 1.0 + F0 * (1.0 / max(Ess, 0.01) - 1.0);
 }
 
 

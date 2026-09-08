@@ -5,7 +5,7 @@
 use gltf::Document;
 use gltf::image::Data;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
 use cgmath::SquareMatrix;
@@ -28,12 +28,14 @@ use crate::common::Bone;
 use crate::common::{AnimationChannel, AnimationClip, AnimationPlayer};
 
 
+#[derive(Clone)]
 pub struct UintRange {
     pub min: u32,
     pub max: u32,
 }
 
 
+#[derive(Clone)]
 pub struct ModelInfo {
     pub model_vertex_range: UintRange,
     pub model_index_range: UintRange,
@@ -42,7 +44,7 @@ pub struct ModelInfo {
 }
 
 impl ModelInfo {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {model_vertex_range: UintRange {min: 0, max: 0}, model_index_range: UintRange {min: 0, max: 0}, model_material_mappings: Vec::new(), skeleton: None}
     }
 }
@@ -56,6 +58,18 @@ pub struct Model {
 
     skeleton: Option<Skeleton>,
     animations: Vec<AnimationClip>,
+}
+
+impl Model {
+    pub fn new() -> Self {
+        Self {vertices: Vec::new(), indices: Vec::new(), material_ids: Vec::new(), materials: Vec::new(), skeleton: None, animations: Vec::new()}
+    }
+}
+
+impl From<&Model> for Model {
+    fn from(item: &Model) -> Self {
+        Model {vertices: item.vertices.clone(), indices: item.indices.clone(), material_ids: item.material_ids.clone(), materials: item.materials.clone(), skeleton: item.skeleton.clone(), animations: item.animations.clone()}
+    }
 }
 
 
@@ -86,7 +100,8 @@ impl Scene {
         }
     }
 
-    pub unsafe fn load_model_into_memory(path: &str, instance: &crate::Instance, device: &crate::Device, data: &mut crate::AppData) -> Result<Model> {
+    pub unsafe fn load_model_into_memory(&mut self, path: &str, instance: &crate::Instance, device: &crate::Device, data: &mut crate::AppData) -> Result<Model> {
+        let old_mat_count = self.model_info.len();
         let (vertices, indices, material_ids, mut materials, images, skeleton, animations) = load_gltf(path)?;
 
         unsafe {
@@ -98,6 +113,13 @@ impl Scene {
                 if material.albedo_texture_index >= 0 {
                     material.albedo_texture_index += texture_offset;
                 }
+            }
+
+            for mat_id in (old_mat_count..old_mat_count + materials.len()).collect::<HashSet<_>>() {
+                if (mat_id) >= data.material_refcounts.len() {
+                    data.material_refcounts.resize(mat_id as usize + 1, 0);
+                }
+                data.material_refcounts[mat_id as usize] += 1;
             }
         }
         
@@ -155,6 +177,7 @@ impl Scene {
 
         self.animations.push(AnimationPlayer::new(model.animations.clone()));
     }
+
 
     pub fn translate_model(&mut self, model_id: usize, offset: Vec3) {
         self.transform_matrices[model_id] = Mat4::from_translation(offset) * self.transform_matrices[model_id];

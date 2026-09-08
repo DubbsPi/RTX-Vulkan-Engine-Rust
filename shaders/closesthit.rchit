@@ -3,10 +3,6 @@
 
 #include "common.glsl"
 
-#extension GL_GOOGLE_include_directive : require
-
-#include "common.glsl"
-
 
 layout(location = 0) rayPayloadInEXT vec3 hitColor;
 layout(location = 1) rayPayloadEXT bool shadowed;
@@ -76,10 +72,7 @@ void main() {
     vec3 albedo = mat.albedo;
 
     if (mat.albedoTextureIndex >= 0) {
-        vec4 textureSample = texture(textures[nonuniformEXT(mat.albedoTextureIndex)], uv);
-        
-        if (textureSample.a < 0.001) return;  // Placeholder for now
-        
+        vec4 textureSample = texture(textures[nonuniformEXT(mat.albedoTextureIndex)], uv);        
         albedo = textureSample.rgb;
     }
 
@@ -87,9 +80,9 @@ void main() {
     vec3 V = -gl_WorldRayDirectionEXT;
     vec3 H = normalize(V + sunLightDir);
     float NdotV = max(dot(normal, V), 0.0001);
-    float NdotL = max(dot(normal, sunLightDir), 0.0001);
+    float NdotL = dot(normal, sunLightDir);
     float NdotH = max(dot(normal, H), 0.0);
-    float VdotH = max(dot(normal, H), 0.0);
+    float VdotH = max(dot(V, H), 0.0);
 
 
     float shadowFactor = 1.0;
@@ -98,7 +91,7 @@ void main() {
         shadowed = true;
         traceRayEXT(
             topLevelAS,
-            gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
+            gl_RayFlagsCullBackFacingTrianglesEXT | gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
             0xFF, 0, 0, 1,
             hitPos + geometricNormal * 0.001,
             0.001, sunLightDir, 10000.0, 1
@@ -107,6 +100,8 @@ void main() {
         shadowFactor = shadowed? 0.05 : 1.0;
     }
 
+    NdotL = max(NdotL, 0.001);
+
 
     const float invPi = 1.0 / PI;
     const vec3 lightColor = vec3(1);
@@ -114,19 +109,23 @@ void main() {
     vec3 F0 = mix(vec3(0.08 * mat.specular), albedo, mat.metallic);
 
     vec3 F;
+    float Fc;
     vec3 specular = cookTorrance(mat.roughness, F0, NdotV, NdotL, NdotH, VdotH, F);
-    vec3 clearcoatLobe = evalClearcoat(mat.clearcoat, mat.clearcoatRoughness, NdotV, NdotL, NdotH, VdotH);
-    vec3 sheenLobe = evalSheen(mat.sheen, mat.sheenColor, VdotH);
+    vec3 clearcoatLobe = evalClearcoat(mat.clearcoat, mat.clearcoatRoughness, NdotV, NdotL, NdotH, VdotH, Fc);
+    vec3 sheenLobe = evalSheen(mat.sheen, mat.sheenColor, mat.roughness, NdotH, NdotV, NdotL);
 
+    specular *= energyCompensation(F0, mat.roughness, NdotV);
+    
     vec3 kd = (1.0 - F) * (1.0 - mat.metallic);
     vec3 diffuseColor = albedo * (1.0 - mat.metallic) * (1.0 - mat.transmission);
     vec3 diffuse = kd * diffuseColor * invPi;
 
-
-    vec3 direct = (diffuse + specular + clearcoatLobe + sheenLobe) * NdotL * lightColor * shadowFactor;
+    vec3 base = (diffuse + specular) * (1.0 - mat.clearcoat * Fc);
+    vec3 direct = (base + clearcoatLobe + sheenLobe) * NdotL * lightColor * shadowFactor;
     
     vec3 reflectDir = reflect(gl_WorldRayDirectionEXT, normal);
-    vec3 reflectionColor = any(greaterThan(F * mat.metallic, vec3(0.05)))? getSky(reflectDir, sunLightDir, cam.viewInverse[3].y) : vec3(0);
-
-    hitColor = direct + mat.emission + reflectionColor * F * mat.metallic;
+    vec3 Fenv = F0 + (max(vec3(1.0 - mat.roughness), F0) - F0) * pow(1.0 - NdotV, 5.0);
+    vec3 reflectionColor = any(greaterThan(Fenv * mat.metallic, vec3(0.05))) ? getSky(reflectDir, sunLightDir, cam.viewInverse[3].y) : vec3(0);
+    
+    hitColor = direct + mat.emission + reflectionColor * Fenv * mat.metallic;
 }

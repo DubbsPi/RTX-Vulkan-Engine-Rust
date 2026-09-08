@@ -1,0 +1,43 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+
+#include "common.glsl"
+
+
+hitAttributeEXT vec2 attribs;
+
+layout(binding = 3, set = 0, scalar) buffer ObjectDescs { ObjectDesc descs[]; };
+layout(binding = 4, set = 0, scalar) buffer Materials { Material mats[]; };
+layout(binding = 5, set = 0, scalar) buffer MaterialIDs { uint materialIds[]; };
+layout(binding = 6, set = 0) uniform sampler2D textures[];
+
+
+void main() {
+    ObjectDesc obj = descs[gl_InstanceCustomIndexEXT];
+    Indices indices = Indices(obj.indexAddress);
+    Vertices vertices = Vertices(obj.vertexAddress);
+
+    uint i0 = indices.i[3 * gl_PrimitiveID];
+    uint i1 = indices.i[3 * gl_PrimitiveID + 1];
+    uint i2 = indices.i[3 * gl_PrimitiveID + 2];
+
+    vec3 bary = vec3(1.0 - attribs.x - attribs.y, attribs.x, attribs.y);
+
+    vec2 uv0 = vertices.vert[i0].uv;
+    vec2 uv1 = vertices.vert[i1].uv;
+    vec2 uv2 = vertices.vert[i2].uv;
+    vec2 uv = uv0 * bary.x + uv1 * bary.y + uv2 * bary.z;
+
+
+    uint materialId = materialIds[obj.materialId + gl_PrimitiveID];
+    Material mat = mats[materialId];
+    
+
+    if (mat.albedoTextureIndex >= 0) {
+        vec4 textureSample = texture(textures[nonuniformEXT(mat.albedoTextureIndex)], uv);
+        
+        if (textureSample.a == 0.0) {
+            ignoreIntersectionEXT;
+        }
+    }
+}

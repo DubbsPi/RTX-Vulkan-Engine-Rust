@@ -1,3 +1,6 @@
+// Some aspects of code are not used yet here. They will be used for though
+#![expect(dead_code)]
+
 use cgmath::{Quaternion, SquareMatrix};
 
 
@@ -10,7 +13,9 @@ pub type Mat4 = cgmath::Matrix4<f32>;
 #[derive(Copy, Clone, Debug)]
 pub struct Vertex {
     pub pos: Vec3,
+    pub _pad0: f32,
     pub normal: Vec3,
+    pub _pad1: f32,
     pub uv: Vec2,
 
     pub joint_indices: [u16; 4],
@@ -29,8 +34,8 @@ impl Vertex {
         };
         
         match uv {
-            Some(a) => Self {pos, normal, uv: a, joint_indices, joint_weights},
-            None => Self {pos, normal, uv: Vec2::new(0.0, 0.0), joint_indices, joint_weights},
+            Some(a) => Self {pos, _pad0: 0.0, normal, _pad1: 0.0, uv: a, joint_indices, joint_weights},
+            None => Self {pos, _pad0: 0.0, normal, _pad1: 0.0, uv: Vec2::new(0.0, 0.0), joint_indices, joint_weights},
         }
     }
 }
