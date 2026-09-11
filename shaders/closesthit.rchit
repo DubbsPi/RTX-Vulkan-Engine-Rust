@@ -30,7 +30,8 @@ float G1(in float NdotX, in float k) {
 
 
 void main() {
-    ObjectDesc obj = descs[gl_InstanceCustomIndexEXT];
+    uint modelIndex = gl_InstanceCustomIndexEXT + gl_GeometryIndexEXT;
+    ObjectDesc obj = descs[modelIndex];
     Indices indices = Indices(obj.indexAddress);
     Vertices vertices = Vertices(obj.vertexAddress);
 

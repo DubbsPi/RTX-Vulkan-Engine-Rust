@@ -5,8 +5,10 @@
 use gltf::Document;
 use gltf::image::Data;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+
+use indexmap::IndexSet;
 
 use cgmath::SquareMatrix;
 use cgmath::vec3;
@@ -41,12 +43,20 @@ pub struct ModelInfo {
     pub model_index_range: UintRange,
     pub model_material_mappings: Vec<u32>,
     pub skeleton: Option<Skeleton>,
+    pub model_class: ModelClass,
 }
 
 impl ModelInfo {
     pub fn new() -> Self {
-        Self {model_vertex_range: UintRange {min: 0, max: 0}, model_index_range: UintRange {min: 0, max: 0}, model_material_mappings: Vec::new(), skeleton: None}
+        Self {model_vertex_range: UintRange {min: 0, max: 0}, model_index_range: UintRange {min: 0, max: 0}, model_material_mappings: Vec::new(), skeleton: None, model_class: ModelClass::Static}
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum ModelClass {
+    Static,
+    SemiDynamic,
+    Dynamic, 
 }
 
 
@@ -85,6 +95,8 @@ pub struct Scene {
     pub transform_matrices: Vec<Mat4>,
 
     pub animations: Vec<AnimationPlayer>,
+
+    pub model_names: IndexSet<String>,
 }
 
 impl Scene {
@@ -97,12 +109,13 @@ impl Scene {
             model_info: Vec::new(),
             transform_matrices: Vec::new(),
             animations: Vec::new(),
+            model_names: IndexSet::new(),
         }
     }
 
     pub unsafe fn load_model_into_memory(&mut self, path: &str, instance: &crate::Instance, device: &crate::Device, data: &mut crate::AppData) -> Result<Model> {
-        let old_mat_count = self.model_info.len();
         let (vertices, indices, material_ids, mut materials, images, skeleton, animations) = load_gltf(path)?;
+        let skeleton = skeleton.or_else(|| Some(dummy_root_skeleton()));
 
         unsafe {
             let texture_offset = data.textures.len() as i32;
@@ -114,20 +127,13 @@ impl Scene {
                     material.albedo_texture_index += texture_offset;
                 }
             }
-
-            for mat_id in (old_mat_count..old_mat_count + materials.len()).collect::<HashSet<_>>() {
-                if (mat_id) >= data.material_refcounts.len() {
-                    data.material_refcounts.resize(mat_id as usize + 1, 0);
-                }
-                data.material_refcounts[mat_id as usize] += 1;
-            }
         }
         
         info!("Loaded {} into memory", path);
         Ok(Model {vertices, indices, material_ids, materials, skeleton, animations})
     }
 
-    pub fn add_model_to_scene(&mut self, model: &Model) {
+    pub fn add_model_to_scene(&mut self, model: &Model, model_class: ModelClass, model_name: Option<String>) {
         let vertex_offset = self.vertices.len() as u32;
         let index_offset = self.indices.len() as u32;
 
@@ -173,9 +179,22 @@ impl Scene {
             model_index_range: UintRange {min: index_offset, max: index_offset + model.indices.len() as u32},
             model_material_mappings: material_mapping,
             skeleton: model.skeleton.clone(),
+            model_class,
         });
 
+        match model_name {
+            Some(mn) => self.model_names.insert(mn),
+            None => self.model_names.insert(self.model_info.len().to_string()),
+        };
         self.animations.push(AnimationPlayer::new(model.animations.clone()));
+    }
+
+
+    pub fn search_for_model_id(&self, model_name: String) -> Option<usize> {
+        if let Some(index) = self.model_names.get_index_of(&model_name) {
+            Some(index);
+        }
+        None
     }
 
 
@@ -243,7 +262,7 @@ fn load_gltf(path: &str) -> Result<(Vec<Vertex>, Vec<u32>, Vec<u32>, Vec<Materia
 
             let joint_weights: Vec<[f32; 4]> = match reader.read_weights(0) {
                 Some(read_weights) => read_weights.into_f32().collect(),
-                None => vec![[0.0, 0.0, 0.0, 0.0]; positions.len()],
+                None => vec![[1.0, 0.0, 0.0, 0.0]; positions.len()],
             };
 
 
@@ -614,6 +633,19 @@ fn extract_skeleton(document: &Document, buffers: &[gltf::buffer::Data]) -> Opti
         .collect();
 
     Some(Skeleton {bones, root_bones})
+}
+
+fn dummy_root_skeleton() -> Skeleton {
+    Skeleton {
+        bones: vec![Bone {
+            node_index: 0,
+            name: "dummy_root".to_string(),
+            children: vec![],
+            local_transform: Mat4::identity(),
+            inverse_bind_matrix: Mat4::identity(),
+        }],
+        root_bones: vec![0],
+    }
 }
 
 fn extract_animations(document: &Document, buffers: &[gltf::buffer::Data], skeleton: &Skeleton) -> Vec<AnimationClip> {

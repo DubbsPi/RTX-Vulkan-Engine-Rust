@@ -24,3 +24,4 @@ serde_json = "1.0"
 vulkanalia = { version = "=0.35.0", features = ["libloading", "provisional", "window"] }
 winit = "0.29"
 bytemuck = "1.25.2"
+indexmap = "2.14.2"

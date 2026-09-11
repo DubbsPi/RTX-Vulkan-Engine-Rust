@@ -13,7 +13,8 @@ layout(binding = 6, set = 0) uniform sampler2D textures[];
 
 
 void main() {
-    ObjectDesc obj = descs[gl_InstanceCustomIndexEXT];
+    uint modelIndex = gl_InstanceCustomIndexEXT + gl_GeometryIndexEXT;
+    ObjectDesc obj = descs[modelIndex];
     Indices indices = Indices(obj.indexAddress);
     Vertices vertices = Vertices(obj.vertexAddress);
 

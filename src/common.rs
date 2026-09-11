@@ -171,7 +171,7 @@ impl AnimationClip {
 
 
 pub struct AnimationPlayer {
-    clips: std::collections::HashMap<String, AnimationClip>,
+    pub clips: std::collections::HashMap<String, AnimationClip>,
     current: Option<String>,
     time: f32,
     playing: bool,
