@@ -1,6 +1,3 @@
-// Some aspects of code are not used yet here. They will be used for though
-#![expect(dead_code)]
-
 use cgmath::{Quaternion, SquareMatrix};
 
 
@@ -67,8 +64,7 @@ pub struct Material {
 #[derive(Clone)]
 pub struct Bone {
     pub node_index: usize,
-    pub name: String,
-    pub children: Vec<usize>,  // Indexes into Skeleton::bones
+    pub children: Vec<usize>,
     pub local_transform: Mat4,
     pub inverse_bind_matrix: Mat4,
 }
@@ -180,11 +176,13 @@ pub struct AnimationPlayer {
 }
 
 impl AnimationPlayer {
+    #[allow(dead_code)]
     pub fn new(clips: Vec<AnimationClip>) -> Self {
         let clips = clips.into_iter().map(|c| (c.name.clone(), c)).collect();
         Self { clips, current: None, time: 0.0, playing: false, looping: true, speed: 1.0 }
     }
 
+    #[allow(dead_code)]
     pub fn play(&mut self, name: &str) {
         if !self.clips.contains_key(name) {
             log::warn!("Animation '{}' not found on this model", name);
@@ -196,6 +194,7 @@ impl AnimationPlayer {
         self.playing = true;
     }
 
+    #[allow(dead_code)]
     pub fn play_fuzzy(&mut self, query: &str) {
         let query_lower = query.to_lowercase();
         let matched = self.clips.keys()
@@ -208,29 +207,35 @@ impl AnimationPlayer {
         }
     }
 
+    #[allow(dead_code)]
     pub fn stop(&mut self) {
         self.playing = false;
         self.time = 0.0;
     }
 
+    #[allow(dead_code)]
     pub fn pause(&mut self) {
         self.playing = false;
     }
 
+    #[allow(dead_code)]
     pub fn resume(&mut self) {
         if self.current.is_some() {
             self.playing = true;
         }
     }
 
+    #[allow(dead_code)]
     pub fn is_playing(&self) -> bool {
         self.playing
     }
 
+    #[allow(dead_code)]
     pub fn current_clip_name(&self) -> Option<&str> {
         self.current.as_deref()
     }
 
+    #[allow(dead_code)]
     pub fn advance(&mut self, dt: f32) {
         if !self.playing {
             return;
@@ -250,6 +255,7 @@ impl AnimationPlayer {
         }
     }
 
+    #[allow(dead_code)]
     pub fn sample(&self, skeleton: &Skeleton) -> Vec<Mat4> {
         let locals: Vec<Mat4> = match self.current.as_ref().and_then(|n| self.clips.get(n)) {
             Some(clip) if self.current.is_some() => clip.sample_local_transforms(skeleton, self.time),
@@ -268,6 +274,7 @@ impl AnimationPlayer {
             .collect()
     }
 
+    #[allow(dead_code)]
     pub fn print_clips(&self, model_label: &str) {
         if self.clips.is_empty() {
             log::info!("[{}] no animations found", model_label);
@@ -278,7 +285,8 @@ impl AnimationPlayer {
             log::info!("  - \"{}\" ({:.2}s, {} channels)", name, clip.duration, clip.channels.len());
         }
     }
-    
+
+    #[allow(dead_code)]
     pub fn list_clips(&self) -> Vec<&str> {
         self.clips.keys().map(|s| s.as_str()).collect()
     }

@@ -40,7 +40,6 @@ use common::Mat4;
 
 mod scene;
 use scene::Scene;
-use scene::UintRange;
 use scene::Model;
 use scene::ModelClass;
 
@@ -451,7 +450,6 @@ impl App {
             &instance, &device, &mut data,
             &scene.materials, &scene.material_ids,
             &scene.model_info,
-            vertex_address, index_address,
         )?;
         
         create_uniform_buffers(&instance, &device, &mut data)?;
@@ -464,6 +462,7 @@ impl App {
             for &mi in &group.members {
                 let model = &scene.model_info[mi];
                 let src = geom_source_for(&device, &data, mi);
+
                 object_descs.push(ObjectDesc {
                     vertex_address: src.vertex_address,
                     index_address: src.index_address,
@@ -592,9 +591,16 @@ impl App {
         self.device.destroy_pipeline(self.data.skinning_pipeline, None);
         self.device.destroy_pipeline_layout(self.data.skinning_pipeline_layout, None);
         self.device.destroy_descriptor_set_layout(self.data.skinning_descriptor_set_layout, None);
-                
+        self.device.destroy_descriptor_pool(self.data.skinning_descriptor_pool, None);
+
+        // Uniform buffers
+        for i in 0..self.data.uniform_buffers.len() {
+            self.device.destroy_buffer(self.data.uniform_buffers[i], None);
+            self.device.free_memory(self.data.uniform_buffers_memory[i], None);
+        }
 
         // Pools and descriptor sets
+        self.device.destroy_descriptor_pool(self.data.descriptor_pool, None);
         self.device.destroy_query_pool(self.data.timestamp_query_pool, None);
         self.device.destroy_descriptor_set_layout(self.data.descriptor_set_layout, None);
 
@@ -1044,12 +1050,16 @@ impl App {
 
         let compute_barrier = vk::MemoryBarrier::builder()
             .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-            .dst_access_mask(vk::AccessFlags::ACCELERATION_STRUCTURE_WRITE_KHR);
+            .dst_access_mask(
+                vk::AccessFlags::ACCELERATION_STRUCTURE_READ_KHR
+                | vk::AccessFlags::ACCELERATION_STRUCTURE_WRITE_KHR
+            );
         self.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::ACCELERATION_STRUCTURE_BUILD_KHR,
             vk::DependencyFlags::empty(), &[compute_barrier], &[] as &[vk::BufferMemoryBarrier], &[] as &[vk::ImageMemoryBarrier]);
 
         let due_for_rebuild = self.data.dynamic_group_frames_since_rebuild >= BLAS_REBUILD_INTERVAL;
         let mode = if due_for_rebuild { vk::BuildAccelerationStructureModeKHR::BUILD } else { vk::BuildAccelerationStructureModeKHR::UPDATE };
+        
         self.refit_group(cmd, GroupKind::Dynamic, mode);
         self.data.dynamic_group_frames_since_rebuild = if due_for_rebuild { 0 } else { self.data.dynamic_group_frames_since_rebuild + 1 };
 
@@ -1093,16 +1103,26 @@ impl App {
     unsafe fn apply_pending_model_ops(&mut self) -> Result<()> { unsafe {
         let pending_ops = std::mem::take(&mut self.data.pending_model_ops);
 
+        let mut added_model_index = None;
+
         for op in pending_ops {
             match op {
                 ModelOp::Add(model, model_class, transform, model_name) => {
-                    let before = self.scene.model_info.len();
+                    let model_index = self.scene.model_info.len();
+
                     self.scene.add_model_to_scene(&model, model_class, model_name);
-                    self.scene.set_transform(before, transform);
+                    self.scene.set_transform(model_index, transform);
                     self.recompute_material_refcounts();
+
+                    added_model_index = Some(model_index);
                 }
+
                 ModelOp::Remove(index) => {
-                    free_skin_resources_for_model(&self.device, &mut self.data, index); // see below
+                    free_skin_resources_for_model(
+                        &self.device,
+                        &mut self.data,
+                        index
+                    );
                     self.remove_model(index)?;
                 }
             }
@@ -1134,9 +1154,18 @@ impl App {
             self.reallocate_all_skinning_descriptor_sets()?; // this already reads current self.data.vertex_buffer, safe now
         }
 
-        let vertex_buffer = self.data.vertex_buffer;
-        allocate_skin_resources_for_model(&self.instance, &self.device, &mut self.data, vertex_buffer,
-            self.scene.model_info.last().unwrap_or(&scene::ModelInfo::new()), &self.scene.indices)?;
+        if let Some(model_index) = added_model_index {
+            let vertex_buffer = self.data.vertex_buffer;
+
+            allocate_skin_resources_for_model(
+                &self.instance,
+                &self.device,
+                &mut self.data,
+                vertex_buffer,
+                &self.scene.model_info[model_index],
+                &self.scene.indices,
+            )?;
+        }
 
         let rigged_count = self.scene.model_info.iter().filter(|m| m.skeleton.is_some()).count() as u32;
         self.data.skinning_pool_capacity = self.data.skinning_pool_capacity.max(rigged_count);
@@ -1195,6 +1224,46 @@ impl App {
 
 
     unsafe fn rebuild_groups_and_tlas(&mut self) -> Result<()> { unsafe {
+        if self.data.tlas != vk::AccelerationStructureKHR::null() {
+            self.device.destroy_acceleration_structure_khr(
+                self.data.tlas,
+                None,
+            );
+        }
+
+        if self.data.tlas_buffer != vk::Buffer::null() {
+            self.device.destroy_buffer(
+                self.data.tlas_buffer,
+                None,
+            );
+            self.device.free_memory(
+                self.data.tlas_buffer_memory,
+                None,
+            );
+        }
+
+        if self.data.tlas_scratch_buffer != vk::Buffer::null() {
+            self.device.destroy_buffer(
+                self.data.tlas_scratch_buffer,
+                None,
+            );
+            self.device.free_memory(
+                self.data.tlas_scratch_buffer_memory,
+                None,
+            );
+        }
+
+        if self.data.instance_buffer != vk::Buffer::null() {
+            self.device.destroy_buffer(
+                self.data.instance_buffer,
+                None,
+            );
+            self.device.free_memory(
+                self.data.instance_buffer_memory,
+                None,
+            );
+        }
+
         let mut static_members = Vec::new();
         let mut semi_members = Vec::new();
         let mut dynamic_members = Vec::new();
@@ -1382,11 +1451,14 @@ impl App {
 
         let compute_barrier = vk::MemoryBarrier::builder()
             .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-            .dst_access_mask(vk::AccessFlags::ACCELERATION_STRUCTURE_WRITE_KHR);
+            .dst_access_mask(
+                vk::AccessFlags::ACCELERATION_STRUCTURE_READ_KHR
+                | vk::AccessFlags::ACCELERATION_STRUCTURE_WRITE_KHR
+            );
         self.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::ACCELERATION_STRUCTURE_BUILD_KHR,
             vk::DependencyFlags::empty(), &[compute_barrier], &[] as &[vk::BufferMemoryBarrier], &[] as &[vk::ImageMemoryBarrier]);
 
-        self.refit_group(cmd, GroupKind::SemiDynamic, vk::BuildAccelerationStructureModeKHR::UPDATE);
+        self.refit_group(cmd, GroupKind::SemiDynamic, vk::BuildAccelerationStructureModeKHR::BUILD);
 
         let as_barrier = vk::MemoryBarrier::builder()
             .src_access_mask(vk::AccessFlags::ACCELERATION_STRUCTURE_WRITE_KHR)
@@ -1399,6 +1471,13 @@ impl App {
         self.device.queue_submit(self.data.graphics_queue, &[vk::SubmitInfo::builder().command_buffers(&cmds)], vk::Fence::null())?;
         self.device.queue_wait_idle(self.data.graphics_queue)?;
         self.device.free_command_buffers(self.data.command_pool, &[cmd]);
+
+        // Rebuild tlas
+        create_tlas(&self.instance, &self.device, &mut self.data)?;
+        
+        // Update descriptor sets to point to the new TLAS
+        self.recreate_descriptor_sets_for_geometry()?;
+
         Ok(())
     }}
 
@@ -1417,14 +1496,22 @@ impl App {
         }).collect();
 
         let group = self.group_ref(kind);
-        let build_info = vk::AccelerationStructureBuildGeometryInfoKHR::builder()
+        let mut build_info = vk::AccelerationStructureBuildGeometryInfoKHR::builder()
             .type_(vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL)
-            .flags(vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE | vk::BuildAccelerationStructureFlagsKHR::ALLOW_UPDATE)
+            .flags(
+                vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE
+                | vk::BuildAccelerationStructureFlagsKHR::ALLOW_UPDATE
+            )
             .mode(mode)
-            .src_acceleration_structure(group.blas)
-            .dst_acceleration_structure(group.blas)
             .geometries(&geometries)
-            .scratch_data(vk::DeviceOrHostAddressKHR {device_address: group.scratch_addr});
+            .dst_acceleration_structure(group.blas)
+            .scratch_data(vk::DeviceOrHostAddressKHR {
+                device_address: group.scratch_addr
+            });
+
+        if mode == vk::BuildAccelerationStructureModeKHR::UPDATE {
+            build_info = build_info.src_acceleration_structure(group.blas);
+        }
 
         let range_refs: Vec<&[_]> = vec![&range_infos[..]];
         self.device.cmd_build_acceleration_structures_khr(cmd, &[build_info], &range_refs);
@@ -1446,14 +1533,10 @@ impl App {
         self.device.destroy_buffer(self.data.material_ids_buffer, None);
         self.device.free_memory(self.data.material_ids_buffer_memory, None);
 
-        let vertex_address = get_buffer_device_address(&self.device, self.data.vertex_buffer);
-        let index_address = get_buffer_device_address(&self.device, self.data.index_buffer);
-
         create_scene_buffers(
             &self.instance, &self.device, &mut self.data,
             &self.scene.materials, &self.scene.material_ids,
             &self.scene.model_info,
-            vertex_address, index_address,
         )?;
 
         Ok(())
@@ -1645,12 +1728,7 @@ struct AppData {
     // Skinning
     skinning_descriptor_pool: vk::DescriptorPool,
     skinned_triangle_counts: Vec<u32>,
-    skinned_index_range_mins: Vec<u32>,
-    skinned_vertex_range_mins: Vec<u32>,
     skinning_pool_capacity: u32,
-
-    // Model updates
-    pending_transform_updates: Vec<(usize, Mat4)>,
 
     // Skinning
     skinning_pipeline: vk::Pipeline,
@@ -1723,8 +1801,11 @@ pub struct SuitabilityError(pub &'static str);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum GroupKind {
+    #[allow(dead_code)]
     Static,
+    #[allow(dead_code)]
     SemiDynamic,
+    #[allow(dead_code)]
     Dynamic
 }
 
@@ -1857,7 +1938,9 @@ enum ModelOp {
 
 
 enum StringOrInt {
+    #[allow(dead_code)]
     Str(String),
+    #[allow(dead_code)]
     Int(usize),
 }
 
@@ -2305,140 +2388,6 @@ unsafe fn create_shader_module(
 
 
 // Scene grouping functions
-fn partition_models(model_info: &[scene::ModelInfo]) -> (Vec<usize>, Vec<usize>, Vec<usize>) {
-    let mut static_idx = Vec::new();
-    let mut semi_idx = Vec::new();
-    let mut dynamic_idx = Vec::new();
-
-    for (i, m) in model_info.iter().enumerate() {
-        match m.model_class {
-            ModelClass::Static => static_idx.push(i),
-            ModelClass::SemiDynamic => semi_idx.push(i),
-            ModelClass::Dynamic => dynamic_idx.push(i),
-        }
-    }
-    (static_idx, semi_idx, dynamic_idx)
-}
-
-unsafe fn build_class_group(
-    instance: &Instance,
-    device: &Device,
-    data: &AppData,
-    sources: &[GeomSource],
-    mode: vk::BuildAccelerationStructureModeKHR,
-    existing: Option<(vk::AccelerationStructureKHR, vk::Buffer, vk::DeviceAddress)>,
-) -> Result<(vk::AccelerationStructureKHR, vk::Buffer, vk::DeviceMemory, vk::Buffer, vk::DeviceMemory, vk::DeviceAddress)> { unsafe {
-    let geometries: Vec<_> = sources.iter().map(|s| {
-        let tri_data = vk::AccelerationStructureGeometryTrianglesDataKHR::builder()
-            .vertex_format(vk::Format::R32G32B32_SFLOAT)
-            .vertex_data(vk::DeviceOrHostAddressConstKHR { device_address: s.vertex_address })
-            .vertex_stride(size_of::<Vertex>() as u64)
-            .max_vertex(s.max_vertex)
-            .index_type(vk::IndexType::UINT32)
-            .index_data(vk::DeviceOrHostAddressConstKHR { device_address: s.index_address })
-            .build();
-        vk::AccelerationStructureGeometryKHR::builder()
-            .geometry_type(vk::GeometryTypeKHR::TRIANGLES)
-            .geometry(vk::AccelerationStructureGeometryDataKHR { triangles: tri_data })
-            .flags(vk::GeometryFlagsKHR::empty())
-            .build()
-    }).collect();
-
-    let triangle_counts: Vec<u32> = sources.iter().map(|s| s.triangle_count).collect();
-    let range_infos: Vec<_> = sources.iter().map(|s| {
-        vk::AccelerationStructureBuildRangeInfoKHR::builder()
-            .primitive_count(s.triangle_count)
-            .primitive_offset(0).first_vertex(0).transform_offset(0)
-            .build()
-    }).collect();
-
-    let mut build_info = vk::AccelerationStructureBuildGeometryInfoKHR::builder()
-        .type_(vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL)
-        .flags(vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE
-            | vk::BuildAccelerationStructureFlagsKHR::ALLOW_UPDATE)
-        .mode(mode)
-        .geometries(&geometries);
-
-    if let Some((existing_as, _, _)) = existing {
-        build_info = build_info
-            .src_acceleration_structure(existing_as)
-            .dst_acceleration_structure(existing_as);
-    }
-
-    let mut size_info = vk::AccelerationStructureBuildSizesInfoKHR::default();
-    device.get_acceleration_structure_build_sizes_khr(
-        vk::AccelerationStructureBuildTypeKHR::DEVICE, &build_info, &triangle_counts, &mut size_info,
-    );
-
-
-    // Create blas
-    let (as_buffer, as_buffer_memory) = match existing {
-        Some((_, buf, _)) if mode == vk::BuildAccelerationStructureModeKHR::UPDATE => {
-            (buf, vk::DeviceMemory::null())
-        }
-        _ => create_buffer(
-            instance, device, data, size_info.acceleration_structure_size,
-            vk::BufferUsageFlags::ACCELERATION_STRUCTURE_STORAGE_KHR | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
-            vk::MemoryPropertyFlags::DEVICE_LOCAL,
-        )?,
-    };
-
-    let blas = if let Some((existing_as, _, _)) = existing {
-        if mode == vk::BuildAccelerationStructureModeKHR::UPDATE { existing_as } else {
-            let create_info = vk::AccelerationStructureCreateInfoKHR::builder()
-                .buffer(as_buffer).size(size_info.acceleration_structure_size)
-                .type_(vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL);
-            device.create_acceleration_structure_khr(&create_info, None)?
-        }
-    } else {
-        let create_info = vk::AccelerationStructureCreateInfoKHR::builder()
-            .buffer(as_buffer).size(size_info.acceleration_structure_size)
-            .type_(vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL);
-        device.create_acceleration_structure_khr(&create_info, None)?
-    };
-
-    let scratch_needed = size_info.build_scratch_size.max(size_info.update_scratch_size);
-    let scratch_alignment = 256u64;
-
-    let (scratch_buffer, scratch_buffer_memory, scratch_addr) =
-        if let Some((_, _, addr)) = existing.filter(|_| mode == vk::BuildAccelerationStructureModeKHR::UPDATE) {
-            (vk::Buffer::null(), vk::DeviceMemory::null(), addr) // reuse caller's scratch on UPDATE
-        } else {
-            let (sb, sm) = create_buffer(
-                instance, device, data, scratch_needed + scratch_alignment,
-                vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
-                vk::MemoryPropertyFlags::DEVICE_LOCAL,
-            )?;
-            let raw = get_buffer_device_address(device, sb);
-            let aligned = (raw + scratch_alignment - 1) & !(scratch_alignment - 1);
-            (sb, sm, aligned)
-        };
-
-
-    build_info = build_info
-        .dst_acceleration_structure(blas)
-        .scratch_data(vk::DeviceOrHostAddressKHR { device_address: scratch_addr });
-
-    let range_info_refs: Vec<&[_]> = vec![&range_infos[..]];
-
-    let alloc_info = vk::CommandBufferAllocateInfo::builder()
-        .level(vk::CommandBufferLevel::PRIMARY)
-        .command_pool(data.command_pool).command_buffer_count(1);
-    let cmd = device.allocate_command_buffers(&alloc_info)?[0];
-    
-    device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::builder()
-        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
-    device.cmd_build_acceleration_structures_khr(cmd, &[build_info], &range_info_refs);
-    device.end_command_buffer(cmd)?;
-
-    let cmds = [cmd];
-    device.queue_submit(data.graphics_queue, &[vk::SubmitInfo::builder().command_buffers(&cmds)], vk::Fence::null())?;
-    device.queue_wait_idle(data.graphics_queue)?;
-    device.free_command_buffers(data.command_pool, &[cmd]);
-
-    Ok((blas, as_buffer, as_buffer_memory, scratch_buffer, scratch_buffer_memory, scratch_addr))
-}}
-
 unsafe fn geom_source_for(device: &Device, data: &AppData, model_index: usize) -> GeomSource { unsafe {
     let vbuf = data.skinned_vertex_buffers[model_index]
         .expect("Everything has an output due to having a root bone");
@@ -3110,8 +3059,6 @@ unsafe fn create_scene_buffers(
     materials: &[Material],
     prim_material_ids: &[u32],
     model_info: &[scene::ModelInfo],
-    vertex_address: u64,
-    index_address: u64,
 ) -> Result<()> { unsafe {
     // Material buffer
     let materials_size = (size_of::<Material>() * materials.len().max(1)).max(1) as u64;
@@ -3134,11 +3081,11 @@ unsafe fn create_scene_buffers(
         let mut push_group = |members: &[usize]| {
             for &mi in members {
                 let model = &model_info[mi];
+                let src = geom_source_for(device, data, mi);
 
                 descs.push(ObjectDesc {
-                    vertex_address,
-                    index_address: index_address
-                        + (model.model_index_range.min as u64 * size_of::<u32>() as u64),
+                    vertex_address: src.vertex_address,
+                    index_address: src.index_address,
                     material_id: model.model_index_range.min / 3,
                     _pad: 0,
                 });
@@ -3199,277 +3146,6 @@ unsafe fn create_scene_buffers(
 
 
 // Acceleration struct creation
-unsafe fn create_blas_for_model(
-    instance: &Instance,
-    device: &Device,
-    data: &AppData,
-    vertex_address: u64,
-    index_address: u64,
-    vertex_range: &UintRange,
-    index_range: &UintRange,
-) -> Result<(vk::AccelerationStructureKHR, vk::Buffer, vk::DeviceMemory, vk::AccelerationStructureBuildSizesInfoKHR)> { unsafe {
-    let triangle_count = (index_range.max - index_range.min) / 3;
-    let model_vertex_count = vertex_range.max - vertex_range.min;
-
-    if triangle_count == 0 || model_vertex_count == 0 {
-        return Err(anyhow!("Cannot build BLAS for empty mesh ranges"));
-    }
-
-    let model_index_address = index_address + (index_range.min as u64 * size_of::<u32>() as u64);
-
-    let triangles_data = vk::AccelerationStructureGeometryTrianglesDataKHR::builder()
-        .vertex_format(vk::Format::R32G32B32_SFLOAT)
-        .vertex_data(vk::DeviceOrHostAddressConstKHR { device_address: vertex_address }) // <- no offset, indices are global
-        .vertex_stride(size_of::<Vertex>() as u64)
-        .max_vertex(vertex_range.max - 1) // <- max GLOBAL index this model can reference
-        .index_type(vk::IndexType::UINT32)
-        .index_data(vk::DeviceOrHostAddressConstKHR { device_address: model_index_address })
-        .build();
-
-    let geometry = vk::AccelerationStructureGeometryKHR::builder()
-        .geometry_type(vk::GeometryTypeKHR::TRIANGLES)
-        .geometry(vk::AccelerationStructureGeometryDataKHR { triangles: triangles_data })
-        .flags(vk::GeometryFlagsKHR::empty())
-        .build();
-
-    let geometries = &[geometry];
-    let mut build_info = vk::AccelerationStructureBuildGeometryInfoKHR::builder()
-        .type_(vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL)
-        .flags(vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE
-            | vk::BuildAccelerationStructureFlagsKHR::ALLOW_UPDATE)
-        .mode(vk::BuildAccelerationStructureModeKHR::BUILD)
-        .geometries(geometries);
-
-    let mut size_info = vk::AccelerationStructureBuildSizesInfoKHR::default();
-    device.get_acceleration_structure_build_sizes_khr(
-        vk::AccelerationStructureBuildTypeKHR::DEVICE,
-        &build_info,
-        &[triangle_count],
-        &mut size_info,
-    );
-
-    // Create blas buffer
-    let (as_buffer, as_buffer_memory) = create_buffer(
-        instance, device, data, size_info.acceleration_structure_size,
-        vk::BufferUsageFlags::ACCELERATION_STRUCTURE_STORAGE_KHR | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
-        vk::MemoryPropertyFlags::DEVICE_LOCAL,
-    )?;
-
-    let create_info = vk::AccelerationStructureCreateInfoKHR::builder()
-        .buffer(as_buffer)
-        .size(size_info.acceleration_structure_size)
-        .type_(vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL);
-    let blas = device.create_acceleration_structure_khr(&create_info, None)?;
-
-    // Scratch buffer with extra padding
-    let scratch_alignment = 256u64;
-    let (scratch_buffer, scratch_buffer_memory) = create_buffer(
-        instance, device, data, size_info.build_scratch_size + scratch_alignment,
-        vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
-        vk::MemoryPropertyFlags::DEVICE_LOCAL,
-    )?;
-
-    let raw_scratch_addr = get_buffer_device_address(device, scratch_buffer);
-    let aligned_scratch_addr = (raw_scratch_addr + scratch_alignment - 1) & !(scratch_alignment - 1);
-
-    build_info = build_info
-        .dst_acceleration_structure(blas)
-        .scratch_data(vk::DeviceOrHostAddressKHR {device_address: aligned_scratch_addr});
-
-
-    let range_info = vk::AccelerationStructureBuildRangeInfoKHR::builder()
-        .primitive_count(triangle_count)
-        .primitive_offset(0)
-        .first_vertex(0)
-        .transform_offset(0)
-        .build();
-
-    let alloc_info = vk::CommandBufferAllocateInfo::builder()
-        .level(vk::CommandBufferLevel::PRIMARY)
-        .command_pool(data.command_pool)
-        .command_buffer_count(1);
-    let cmd = device.allocate_command_buffers(&alloc_info)?[0];
-
-    let begin_info = vk::CommandBufferBeginInfo::builder()
-        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-    device.begin_command_buffer(cmd, &begin_info)?;
-
-    device.cmd_build_acceleration_structures_khr(
-        cmd,
-        &[build_info],
-        &[&[range_info]],
-    );
-
-    device.end_command_buffer(cmd)?;
-
-    let command_buffers = [cmd];
-    let submit_info = vk::SubmitInfo::builder().command_buffers(&command_buffers);
-    device.queue_submit(data.graphics_queue, &[submit_info], vk::Fence::null())?;
-    device.queue_wait_idle(data.graphics_queue)?;
-    device.free_command_buffers(data.command_pool, &[cmd]);
-
-    // Cleanup scratch
-    device.destroy_buffer(scratch_buffer, None);
-    device.free_memory(scratch_buffer_memory, None);
-    
-    Ok((blas, as_buffer, as_buffer_memory, size_info))
-}}
-
-unsafe fn create_merged_blas_for_group(
-    instance: &Instance,
-    device: &Device,
-    data: &AppData,
-    vertex_address: u64,
-    index_address: u64,
-    model_info: &[scene::ModelInfo],
-    indices: &[usize],
-    mode: vk::BuildAccelerationStructureModeKHR,
-    existing: Option<vk::AccelerationStructureKHR>,
-    existing_scratch_addr: Option<vk::DeviceAddress>,
-) -> Result<(
-    vk::AccelerationStructureKHR,
-    vk::Buffer,
-    vk::DeviceMemory,
-    vk::Buffer,
-    vk::DeviceMemory,
-    vk::DeviceAddress,
-)> { unsafe {
-    if indices.is_empty() {
-        return Err(anyhow!("Cannot build a merged BLAS for an empty group"));
-    }
-
-    if mode == vk::BuildAccelerationStructureModeKHR::UPDATE
-        && (existing.is_none() || existing_scratch_addr.is_none())
-    {
-        return Err(anyhow!("UPDATE mode requires an existing acceleration structure and scratch address"));
-    }
-
-    // Get geometry
-    let mut geometries = Vec::with_capacity(indices.len());
-    let mut triangle_counts = Vec::with_capacity(indices.len());
-    let mut range_infos = Vec::with_capacity(indices.len());
-
-    for &model_index in indices {
-        let model = &model_info[model_index];
-
-        let triangle_count = (model.model_index_range.max - model.model_index_range.min) / 3;
-        let model_vertex_count = model.model_vertex_range.max - model.model_vertex_range.min;
-
-        if triangle_count == 0 || model_vertex_count == 0 {
-            return Err(anyhow!("Cannot build BLAS geometry for empty mesh ranges (model {})", model_index));
-        }
-
-        let model_index_address = index_address
-            + (model.model_index_range.min as u64 * size_of::<u32>() as u64);
-
-        let triangles_data = vk::AccelerationStructureGeometryTrianglesDataKHR::builder()
-            .vertex_format(vk::Format::R32G32B32_SFLOAT)
-            .vertex_data(vk::DeviceOrHostAddressConstKHR { device_address: vertex_address })
-            .vertex_stride(size_of::<Vertex>() as u64)
-            .max_vertex(model.model_vertex_range.max - 1)
-            .index_type(vk::IndexType::UINT32)
-            .index_data(vk::DeviceOrHostAddressConstKHR { device_address: model_index_address })
-            .build();
-
-        let geometry = vk::AccelerationStructureGeometryKHR::builder()
-            .geometry_type(vk::GeometryTypeKHR::TRIANGLES)
-            .geometry(vk::AccelerationStructureGeometryDataKHR { triangles: triangles_data })
-            .flags(vk::GeometryFlagsKHR::empty())
-            .build();
-
-        geometries.push(geometry);
-        triangle_counts.push(triangle_count);
-        range_infos.push(
-            vk::AccelerationStructureBuildRangeInfoKHR::builder()
-                .primitive_count(triangle_count)
-                .primitive_offset(0)
-                .first_vertex(0)
-                .transform_offset(0)
-                .build(),
-        );
-    }
-
-    // Query sizes
-    let mut build_info = vk::AccelerationStructureBuildGeometryInfoKHR::builder()
-        .type_(vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL)
-        .flags(
-            vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE
-                | vk::BuildAccelerationStructureFlagsKHR::ALLOW_UPDATE,
-        )
-        .mode(mode)
-        .geometries(&geometries);
-
-    if let Some(existing_as) = existing {
-        build_info = build_info
-            .src_acceleration_structure(existing_as)
-            .dst_acceleration_structure(existing_as);
-    }
-
-    let mut size_info = vk::AccelerationStructureBuildSizesInfoKHR::default();
-    device.get_acceleration_structure_build_sizes_khr(
-        vk::AccelerationStructureBuildTypeKHR::DEVICE,
-        &build_info,
-        &triangle_counts,
-        &mut size_info,
-    );
-
-
-    // Create blas buffer
-    let (as_buffer, as_buffer_memory) = create_buffer(
-        instance, device, data, size_info.acceleration_structure_size,
-        vk::BufferUsageFlags::ACCELERATION_STRUCTURE_STORAGE_KHR | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
-        vk::MemoryPropertyFlags::DEVICE_LOCAL,
-    )?;
-
-    let create_info = vk::AccelerationStructureCreateInfoKHR::builder()
-        .buffer(as_buffer)
-        .size(size_info.acceleration_structure_size)
-        .type_(vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL);
-    let blas = device.create_acceleration_structure_khr(&create_info, None)?;
-
-    // Scratch buffer with extra padding
-    let scratch_alignment = 256u64;
-    let (scratch_buffer, scratch_buffer_memory) = create_buffer(
-        instance, device, data, size_info.build_scratch_size + scratch_alignment,
-        vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
-        vk::MemoryPropertyFlags::DEVICE_LOCAL,
-    )?;
-
-    let raw_scratch_addr = get_buffer_device_address(device, scratch_buffer);
-    let scratch_addr = (raw_scratch_addr + scratch_alignment - 1) & !(scratch_alignment - 1);
-
-
-    build_info = build_info
-        .dst_acceleration_structure(blas)
-        .scratch_data(vk::DeviceOrHostAddressKHR { device_address: scratch_addr });
-
-    // Submit the build for everything
-    let alloc_info = vk::CommandBufferAllocateInfo::builder()
-        .level(vk::CommandBufferLevel::PRIMARY)
-        .command_pool(data.command_pool)
-        .command_buffer_count(1);
-    let cmd = device.allocate_command_buffers(&alloc_info)?[0];
-
-    let begin_info = vk::CommandBufferBeginInfo::builder()
-        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-    device.begin_command_buffer(cmd, &begin_info)?;
-
-    let range_info_refs: Vec<&[vk::AccelerationStructureBuildRangeInfoKHR]> =
-        vec![range_infos.as_slice()];
-
-    device.cmd_build_acceleration_structures_khr(cmd, &[build_info], &range_info_refs);
-
-    device.end_command_buffer(cmd)?;
-
-    let command_buffers = [cmd];
-    let submit_info = vk::SubmitInfo::builder().command_buffers(&command_buffers);
-    device.queue_submit(data.graphics_queue, &[submit_info], vk::Fence::null())?;
-    device.queue_wait_idle(data.graphics_queue)?;
-    device.free_command_buffers(data.command_pool, &[cmd]);
-
-    Ok((blas, as_buffer, as_buffer_memory, scratch_buffer, scratch_buffer_memory, scratch_addr))
-}}
-
 unsafe fn rebuild_group_cold(
     instance: &Instance,
     device: &Device,
@@ -4402,9 +4078,21 @@ fn main() -> Result<()> {
                         }
                     },
 
+                    winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::KeyL) => {
+                        if pressed {
+                            let transform = Mat4::from_translation(vec3(app.camera.position.x, app.camera.position.y, app.camera.position.z)) * Mat4::identity();
+                            unsafe {let _ = app.move_semi_dynamic_model(app.scene.model_info.len() - 1, transform);}
+                        }
+                    },
+
                     winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::KeyI) => {
                         if pressed {
                             app.queue_remove_model(StringOrInt::Int(app.scene.model_info.len() - 1));
+                        }
+                    },
+                    winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::KeyK) => {
+                        if pressed {
+                            app.queue_remove_model(StringOrInt::Str("Xenon".to_owned()));
                         }
                     },
 

@@ -1,5 +1,4 @@
 // Some aspects of code are not used yet here. They will be used for though
-#![expect(dead_code)]
 
 
 use gltf::Document;
@@ -41,16 +40,10 @@ pub struct UintRange {
 pub struct ModelInfo {
     pub model_vertex_range: UintRange,
     pub model_index_range: UintRange,
-    pub model_material_mappings: Vec<u32>,
     pub skeleton: Option<Skeleton>,
     pub model_class: ModelClass,
 }
 
-impl ModelInfo {
-    pub fn new() -> Self {
-        Self {model_vertex_range: UintRange {min: 0, max: 0}, model_index_range: UintRange {min: 0, max: 0}, model_material_mappings: Vec::new(), skeleton: None, model_class: ModelClass::Static}
-    }
-}
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum ModelClass {
@@ -70,11 +63,6 @@ pub struct Model {
     animations: Vec<AnimationClip>,
 }
 
-impl Model {
-    pub fn new() -> Self {
-        Self {vertices: Vec::new(), indices: Vec::new(), material_ids: Vec::new(), materials: Vec::new(), skeleton: None, animations: Vec::new()}
-    }
-}
 
 impl From<&Model> for Model {
     fn from(item: &Model) -> Self {
@@ -177,7 +165,6 @@ impl Scene {
         self.model_info.push(ModelInfo {
             model_vertex_range: UintRange {min: vertex_offset, max: vertex_offset + model.vertices.len() as u32},
             model_index_range: UintRange {min: index_offset, max: index_offset + model.indices.len() as u32},
-            model_material_mappings: material_mapping,
             skeleton: model.skeleton.clone(),
             model_class,
         });
@@ -618,7 +605,6 @@ fn extract_skeleton(document: &Document, buffers: &[gltf::buffer::Data]) -> Opti
 
             Bone {
                 node_index: node.index(),
-                name: node.name().unwrap_or("unnamed_bone").to_string(),
                 children,
                 local_transform,
                 inverse_bind_matrix: inverse_bind_matrices[bone_idx],
@@ -639,7 +625,6 @@ fn dummy_root_skeleton() -> Skeleton {
     Skeleton {
         bones: vec![Bone {
             node_index: 0,
-            name: "dummy_root".to_string(),
             children: vec![],
             local_transform: Mat4::identity(),
             inverse_bind_matrix: Mat4::identity(),
