@@ -29,6 +29,17 @@ const float hr = 8500.0;
 const float hm = 1200.0;
 
 
+// Disabled for now
+#define FOG_SAMPLES 32
+#define LIGHT_SAMPLES 4
+#define QUADRATIC_FOG
+
+const float maxFogDist = 100.0;
+
+
+const int MAX_BOUNCES = 8;
+
+
 struct Vertex {
     vec3 p;
     float pad0;
@@ -37,6 +48,16 @@ struct Vertex {
     vec2 uv;
     uint16_t ji[4];
     float jw[4];
+};
+
+
+struct RayPayload {
+    vec3 radiance;
+    vec3 throughput;
+    vec3 nextOrigin;
+    vec3 nextDirection;
+    uint rngState;
+    bool terminated;
 };
 
 
@@ -230,6 +251,78 @@ vec3 evalSheen(in float sheen, in vec3 sheenColor, in float roughness, in float 
 vec3 energyCompensation(in vec3 F0, in float roughness, in float NdotV) {
     float Ess = 1.0 - pow(1.0 - NdotV, 5.0 - 4.0 * roughness);
     return 1.0 + F0 * (1.0 / max(Ess, 0.01) - 1.0);
+}
+
+
+uint hash(in uint x) {
+    x ^= x >> 17; x *= 0xbf324c81u;
+    x ^= x >> 11; x *= 0x68bc2a9du;
+    x ^= x >> 16;
+    return x;
+}
+
+uint pcg(inout uint state) {
+    uint prev = state * 747796405u + 2891336453u;
+    uint word = ((prev >> ((prev >> 28u) + 4u)) ^ prev) * 277803737u;
+    state = prev;
+    return (word >> 22u) ^ word;
+}
+
+float rand(inout uint seed) {
+    seed = pcg(seed);
+    return float(seed) / float(0xFFFFFFFFu);
+}
+
+uint randInt(in uvec2 pixel, in uvec2 resolution, in uint frameIndex) {
+    uint seed = pixel.x + pixel.y * resolution.x;
+    seed = hash(seed ^ hash(frameIndex));
+    return seed;
+}
+
+vec3 cosineHemisphere(in vec3 normal, inout uint seed) {
+    float r1 = rand(seed);
+    float r2 = rand(seed);
+    
+    float phi = 2.0 * PI * r1;
+    float sqrtR2 = sqrt(r2);
+    
+    vec3 up = abs(normal.y) < 0.999 ? vec3(0,1,0) : vec3(1,0,0);
+    vec3 tangent   = normalize(cross(up, normal));
+    vec3 bitangent = cross(normal, tangent);
+    
+    return normalize(
+        tangent   * cos(phi) * sqrtR2 +
+        bitangent * sin(phi) * sqrtR2 +
+        normal    * sqrt(1.0 - r2)
+    );
+}
+
+float hash3(vec3 p) {
+    p = fract(p * 0.1031);
+    p += dot(p, p.yzx + 33.33);
+    return fract((p.x + p.y) * p.z);
+}
+
+
+vec3 sampleGGX(inout uint seed, in vec3 normal, in float roughness) {
+    float r1 = rand(seed);
+    float r2 = rand(seed);
+
+    float a = max(roughness, 0.045);
+    a = a * a;
+
+    // GGX importance sampling
+    float phi = 2.0 * PI * r1;
+    float cosTheta = sqrt((1.0 - r2) / (1.0 + (a * a - 1.0) * r2));
+    float sinTheta = sqrt(max(1.0 - cosTheta * cosTheta, 0.0));
+
+    vec3 H_tangent = vec3(sinTheta * cos(phi), sinTheta * sin(phi), cosTheta);
+
+    vec3 up = abs(normal.y) < 0.999 ? vec3(0, 1, 0) : vec3(1, 0, 0);
+    vec3 tangent = normalize(cross(up, normal));
+    vec3 bitangent = cross(normal, tangent);
+
+    return normalize(tangent * H_tangent.x + bitangent * H_tangent.y + normal * H_tangent.z);
 }
 
 

@@ -2,9 +2,10 @@
 #extension GL_GOOGLE_include_directive : require
 
 #include "common.glsl"
+#include "fog.glsl"
 
 
-layout(location = 0) rayPayloadInEXT vec3 hitColor;
+layout(location = 0) rayPayloadInEXT RayPayload payload;
 layout(location = 1) rayPayloadEXT bool shadowed;
 
 hitAttributeEXT vec2 attribs;
@@ -21,7 +22,7 @@ layout(binding = 3, set = 0, scalar) buffer ObjectDescs {ObjectDesc descs[];};
 layout(binding = 4, set = 0, scalar) buffer Materials {Material mats[];};
 layout(binding = 5, set = 0, scalar) buffer MaterialIDs {uint materialIds[];};
 
-layout(binding = 6, set = 0) uniform sampler2D textures[];
+layout(binding = 7, set = 0) uniform sampler2D textures[];
 
 
 float G1(in float NdotX, in float k) {
@@ -30,6 +31,7 @@ float G1(in float NdotX, in float k) {
 
 
 void main() {
+    vec3 camPos = cam.viewInverse[3].xyz;
     uint modelIndex = gl_InstanceCustomIndexEXT + gl_GeometryIndexEXT;
     ObjectDesc obj = descs[modelIndex];
     Indices indices = Indices(obj.indexAddress);
@@ -126,7 +128,28 @@ void main() {
     
     vec3 reflectDir = reflect(gl_WorldRayDirectionEXT, normal);
     vec3 Fenv = F0 + (max(vec3(1.0 - mat.roughness), F0) - F0) * pow(1.0 - NdotV, 5.0);
-    vec3 reflectionColor = any(greaterThan(Fenv * mat.metallic, vec3(0.05))) ? getSky(reflectDir, sunLightDir, cam.viewInverse[3].y) : vec3(0);
+    vec3 reflectionColor = any(greaterThan(Fenv * mat.metallic, vec3(0.05)))? getSky(reflectDir, sunLightDir, camPos.y) : vec3(0);
     
-    hitColor = direct + mat.emission + reflectionColor * Fenv * mat.metallic;
+
+    //mat2x3 fog = marchFog(camPos, gl_WorldRayDirectionEXT, gl_RayTmaxEXT);
+
+    payload.radiance = (direct + mat.emission);// * fog[1] + fog[0];
+
+    vec3 bounceDir;
+    vec3 brdfWeight;
+
+    float specProb = mat.metallic * 0.5 + 0.5 * max(F0.r, max(F0.g, F0.b));
+    if (rand(payload.rngState) < specProb) {
+        vec3 H_sample = sampleGGX(payload.rngState, normal, mat.roughness);
+        bounceDir = reflect(gl_WorldRayDirectionEXT, H_sample);
+        brdfWeight = specular / specProb;
+    } else {
+        bounceDir = cosineHemisphere(normal, payload.rngState);
+        brdfWeight = diffuseColor / (1.0 - specProb);
+    }
+
+    payload.throughput = brdfWeight;
+    payload.nextOrigin = hitPos + geometricNormal * 0.001;
+    payload.nextDirection = bounceDir;
+    payload.terminated = false;
 }

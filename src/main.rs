@@ -80,6 +80,13 @@ unsafe fn create_scene(instance: &Instance, device: &Device, data: &mut AppData,
             &instance, &device, data,
         )?;
 
+        let interior = Scene::load_model_into_memory(
+            &mut scene,
+            "models/interior.glb",
+            instance, device, data
+        )?;
+
+
         scene.add_model_to_scene(&magazine, ModelClass::Static, None);
         scene.add_model_to_scene(&magazine, ModelClass::Static, None);
 
@@ -91,6 +98,9 @@ unsafe fn create_scene(instance: &Instance, device: &Device, data: &mut AppData,
 
         scene.add_model_to_scene(&protogen, ModelClass::Dynamic, Some("Xenon".to_owned()));
         scene.translate_model(2, vec3(-4.0, 0.0, 0.0));
+    
+        scene.add_model_to_scene(&interior, ModelClass::Static, Some("House".to_owned()));
+        scene.scale_model(3, vec3(0.005, 0.005, 0.005));
     }
 
     Ok(scene)
@@ -214,7 +224,9 @@ impl App {
         create_swapchain(window, &instance, &device, &mut data)?;
 
         create_command_pool(&instance, &device, &mut data)?;
+
         create_storage_image(&instance, &device, &mut data)?;
+        create_accum_image(&instance, &device, &mut data)?;
 
 
         // Scene setup
@@ -593,14 +605,7 @@ impl App {
         self.device.destroy_descriptor_set_layout(self.data.skinning_descriptor_set_layout, None);
         self.device.destroy_descriptor_pool(self.data.skinning_descriptor_pool, None);
 
-        // Uniform buffers
-        for i in 0..self.data.uniform_buffers.len() {
-            self.device.destroy_buffer(self.data.uniform_buffers[i], None);
-            self.device.free_memory(self.data.uniform_buffers_memory[i], None);
-        }
-
         // Pools and descriptor sets
-        self.device.destroy_descriptor_pool(self.data.descriptor_pool, None);
         self.device.destroy_query_pool(self.data.timestamp_query_pool, None);
         self.device.destroy_descriptor_set_layout(self.data.descriptor_set_layout, None);
 
@@ -633,24 +638,30 @@ impl App {
             self.device.free_memory(self.data.storage_image_memories[i], None);
         }
 
+        for i in 0..self.data.accum_images.len() {
+            self.device.destroy_image_view(self.data.accum_image_views[i], None);
+            self.device.destroy_image(self.data.accum_images[i], None);
+            self.device.free_memory(self.data.accum_image_memories[i], None);
+        }
+        
 
         self.device.destroy_pipeline(self.data.rt_pipeline, None);
         self.device.destroy_pipeline_layout(self.data.rt_pipeline_layout, None);
 
         self.device.destroy_descriptor_pool(self.data.descriptor_pool, None);
 
-        self.data.uniform_buffers
-            .iter()
-            .for_each(|b| self.device.destroy_buffer(*b, None));
-        self.data.uniform_buffers_memory
-            .iter()
-            .for_each(|m| self.device.free_memory(*m, None));
+        for buffer in self.data.uniform_buffers.drain(..) {
+            self.device.destroy_buffer(buffer, None);
+        }
+        for memory in self.data.uniform_buffers_memory.drain(..) {
+            self.device.free_memory(memory, None);
+        }
 
         self.device.free_command_buffers(self.data.command_pool, &self.data.command_buffers);
 
-        self.data.swapchain_image_views
-            .iter()
-            .for_each(|v| self.device.destroy_image_view(*v, None));
+        for view in self.data.swapchain_image_views.drain(..) {
+            self.device.destroy_image_view(view, None);
+        }
 
         self.device.destroy_swapchain_khr(self.data.swapchain, None);
     }}
@@ -764,6 +775,39 @@ impl App {
             0,
             &[self.data.descriptor_sets[image_index]],
             &[],
+        );
+
+
+        let current_view = self.camera.view_matrix();
+        let camera_moved = match self.data.last_view_matrix {
+            Some(last) => {
+                // cheap epsilon compare - cgmath matrices don't impl PartialEq with epsilon by default
+                let diff: f32 = (0..4).flat_map(|c| (0..4).map(move |r| (c, r)))
+                    .map(|(c, r)| (current_view[c][r] - last[c][r]).abs())
+                    .sum();
+                diff > 0.0001
+            }
+            None => true,
+        };
+
+        self.data.frame_index = self.data.frame_index.wrapping_add(1);
+        self.data.accumulated_samples = if camera_moved { 0 } else { self.data.accumulated_samples + 1 };
+        self.data.last_view_matrix = Some(current_view);
+
+        let push_constants = RtPushConstants {
+            frame_index: self.data.frame_index,
+            accumulated_samples: self.data.accumulated_samples,
+        };
+
+        self.device.cmd_push_constants(
+            cmd,
+            self.data.rt_pipeline_layout,
+            vk::ShaderStageFlags::RAYGEN_KHR,
+            0,
+            std::slice::from_raw_parts(
+                (&push_constants as *const RtPushConstants).cast::<u8>(),
+                size_of::<RtPushConstants>(),
+            ),
         );
 
         self.device.cmd_trace_rays_khr(
@@ -955,6 +999,8 @@ impl App {
         create_swapchain(window, &self.instance, &self.device, &mut self.data)?;
 
         create_storage_image(&self.instance, &self.device, &mut self.data)?;
+        create_accum_image(&self.instance, &self.device, &mut self.data)?;
+
         create_rt_pipeline(&self.device, &mut self.data)?;
 
         create_shader_binding_table(&self.instance, &self.device, &mut self.data)?;
@@ -964,6 +1010,9 @@ impl App {
         create_descriptor_sets(&self.device, &mut self.data)?;
 
         create_command_buffers(&self.device, &mut self.data)?;
+
+        self.data.accumulated_samples = 0;
+        self.data.last_view_matrix = None;
 
         self.data.queries_valid = [false; MAX_FRAMES_IN_FLIGHT];
         self.data.images_in_flight = vec![vk::Fence::null(); self.data.swapchain_images.len()];
@@ -1592,10 +1641,11 @@ impl App {
                 .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                 .buffer_info(std::slice::from_ref(&material_ids_info)).build());
 
+            
             if !texture_infos.is_empty() {
                 writes.push(vk::WriteDescriptorSet::builder()
                     .dst_set(self.data.descriptor_sets[i])
-                    .dst_binding(6)
+                    .dst_binding(7)
                     .dst_array_element(0)
                     .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                     .image_info(&texture_infos)
@@ -1689,6 +1739,15 @@ struct AppData {
     storage_images: Vec<vk::Image>,
     storage_image_memories: Vec<vk::DeviceMemory>,
     storage_image_views: Vec<vk::ImageView>,
+
+    // TA images
+    accum_images: Vec<vk::Image>,
+    accum_image_memories: Vec<vk::DeviceMemory>,
+    accum_image_views: Vec<vk::ImageView>,
+
+    accumulated_samples: u32,
+    frame_index: u32,
+    last_view_matrix: Option<Mat4>,
 
     // Geometry
     vertex_buffer: vk::Buffer,
@@ -1942,6 +2001,14 @@ enum StringOrInt {
     Str(String),
     #[allow(dead_code)]
     Int(usize),
+}
+
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+struct RtPushConstants {
+    frame_index: u32,
+    accumulated_samples: u32,
 }
 
 
@@ -2282,6 +2349,7 @@ unsafe fn create_logical_device(
 fn get_swapchain_surface_format(
     formats: &[vk::SurfaceFormatKHR],
 ) -> vk::SurfaceFormatKHR {
+    info!("Using B8G8R8A8_SRGB swapchain format");
     formats
         .iter()
         .cloned()
@@ -2295,7 +2363,7 @@ fn get_swapchain_surface_format(
 fn get_swapchain_present_mode(
     _present_modes: &[vk::PresentModeKHR],
 ) -> vk::PresentModeKHR {
-    vk::PresentModeKHR::FIFO
+    vk::PresentModeKHR::MAILBOX
 }
 
 fn get_swapchain_extent(
@@ -2661,177 +2729,11 @@ unsafe fn create_command_buffers(device: &Device, data: &mut AppData) -> Result<
 
     data.command_buffers = device.allocate_command_buffers(&allocate_info)?;
 
-    for (i, command_buffer) in data.command_buffers.iter().enumerate() {
-        let command_buffer = *command_buffer;
-        let first_query = (i as u32) * 2;
-
-        let begin_info = vk::CommandBufferBeginInfo::builder();
-        device.begin_command_buffer(command_buffer, &begin_info)?;
-
-        device.cmd_reset_query_pool(
-            command_buffer,
-            data.timestamp_query_pool,
-            first_query,
-            2,
-        );
-
-        device.cmd_write_timestamp(
-            command_buffer,
-            vk::PipelineStageFlags::TOP_OF_PIPE,
-            data.timestamp_query_pool,
-            (i as u32) * 2,
-        );
-
-        // Bind rt pipeline
-        device.cmd_bind_pipeline(
-            command_buffer,
-            vk::PipelineBindPoint::RAY_TRACING_KHR,
-            data.rt_pipeline,
-        );
-        device.cmd_bind_descriptor_sets(
-            command_buffer,
-            vk::PipelineBindPoint::RAY_TRACING_KHR,
-            data.rt_pipeline_layout,
-            0,
-            &[data.descriptor_sets[i]],
-            &[],
-        );
-
-        device.cmd_trace_rays_khr(
-            command_buffer,
-            &data.sbt_raygen_region,
-            &data.sbt_miss_region,
-            &data.sbt_hit_region,
-            &data.sbt_callable_region,
-            data.swapchain_extent.width,
-            data.swapchain_extent.height,
-            1,
-        );
-
-        // Setup barriers
-        let storage_image_barrier = vk::ImageMemoryBarrier::builder()
-            .old_layout(vk::ImageLayout::GENERAL)
-            .new_layout(vk::ImageLayout::GENERAL)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .image(data.storage_images[i])
-            .subresource_range(vk::ImageSubresourceRange::builder()
-                .aspect_mask(vk::ImageAspectFlags::COLOR)
-                .base_mip_level(0)
-                .level_count(1)
-                .base_array_layer(0)
-                .layer_count(1)
-                .build())
-            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-            .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
-
-        let swapchain_image_barrier = vk::ImageMemoryBarrier::builder()
-            .old_layout(vk::ImageLayout::UNDEFINED)
-            .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .image(data.swapchain_images[i])
-            .subresource_range(vk::ImageSubresourceRange::builder()
-                .aspect_mask(vk::ImageAspectFlags::COLOR)
-                .base_mip_level(0)
-                .level_count(1)
-                .base_array_layer(0)
-                .layer_count(1)
-                .build())
-            .src_access_mask(vk::AccessFlags::empty())
-            .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
-
-        device.cmd_pipeline_barrier(
-            command_buffer,
-            vk::PipelineStageFlags::RAY_TRACING_SHADER_KHR,
-            vk::PipelineStageFlags::TRANSFER,
-            vk::DependencyFlags::empty(),
-            &[] as &[vk::MemoryBarrier],
-            &[] as &[vk::BufferMemoryBarrier],
-            &[storage_image_barrier, swapchain_image_barrier],
-        );
-
-        // Use blit due to different image formats
-        let blit_region = vk::ImageBlit::builder()
-            .src_subresource(vk::ImageSubresourceLayers::builder()
-                .aspect_mask(vk::ImageAspectFlags::COLOR)
-                .mip_level(0)
-                .base_array_layer(0)
-                .layer_count(1)
-                .build())
-            .src_offsets([
-                vk::Offset3D {x: 0, y: 0, z: 0},
-                vk::Offset3D {
-                    x: data.swapchain_extent.width as i32,
-                    y: data.swapchain_extent.height as i32,
-                    z: 1,
-                },
-            ])
-            .dst_subresource(vk::ImageSubresourceLayers::builder()
-                .aspect_mask(vk::ImageAspectFlags::COLOR)
-                .mip_level(0)
-                .base_array_layer(0)
-                .layer_count(1)
-                .build())
-            .dst_offsets([
-                vk::Offset3D {x: 0, y: 0, z: 0},
-                vk::Offset3D {
-                    x: data.swapchain_extent.width as i32,
-                    y: data.swapchain_extent.height as i32,
-                    z: 1,
-                },
-            ]);
-
-        device.cmd_blit_image(
-            command_buffer,
-            data.storage_images[i],
-            vk::ImageLayout::GENERAL,
-            data.swapchain_images[i],
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            &[blit_region],
-            vk::Filter::NEAREST,
-        );
-
-        // Move image to presentable format
-        let present_barrier = vk::ImageMemoryBarrier::builder()
-            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-            .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .image(data.swapchain_images[i])
-            .subresource_range(vk::ImageSubresourceRange::builder()
-                .aspect_mask(vk::ImageAspectFlags::COLOR)
-                .base_mip_level(0)
-                .level_count(1)
-                .base_array_layer(0)
-                .layer_count(1)
-                .build())
-            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-            .dst_access_mask(vk::AccessFlags::empty());
-
-        device.cmd_pipeline_barrier(
-            command_buffer,
-            vk::PipelineStageFlags::TRANSFER,
-            vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-            vk::DependencyFlags::empty(),
-            &[] as &[vk::MemoryBarrier],
-            &[] as &[vk::BufferMemoryBarrier],
-            &[present_barrier],
-        );
-
-        device.cmd_write_timestamp(
-            command_buffer,
-            vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-            data.timestamp_query_pool,
-            (i as u32) * 2 + 1,
-        );
-
-        device.end_command_buffer(command_buffer)?;
-    }
-
     Ok(())
 }}
 
+
+// Image functions
 unsafe fn create_storage_image(
     instance: &Instance,
     device: &Device,
@@ -2844,7 +2746,7 @@ unsafe fn create_storage_image(
     for _ in 0..data.swapchain_images.len() {
         let info = vk::ImageCreateInfo::builder()
             .image_type(vk::ImageType::_2D)
-            .format(vk::Format::R8G8B8A8_UNORM)
+            .format(vk::Format::R16G16B16A16_SFLOAT)
             .extent(vk::Extent3D {
                 width: data.swapchain_extent.width,
                 height: data.swapchain_extent.height,
@@ -2880,7 +2782,7 @@ unsafe fn create_storage_image(
         let view_info = vk::ImageViewCreateInfo::builder()
             .image(image)
             .view_type(vk::ImageViewType::_2D)
-            .format(vk::Format::R8G8B8A8_UNORM)
+            .format(vk::Format::R16G16B16A16_SFLOAT)
             .subresource_range(subresource_range);
 
         let view = device.create_image_view(&view_info, None)?;
@@ -2900,6 +2802,106 @@ unsafe fn create_storage_image(
     device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
 
     for &image in &data.storage_images {
+        let barrier = vk::ImageMemoryBarrier::builder()
+            .old_layout(vk::ImageLayout::UNDEFINED)
+            .new_layout(vk::ImageLayout::GENERAL)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(image)
+            .subresource_range(vk::ImageSubresourceRange::builder()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .level_count(1)
+                .layer_count(1)
+                .build())
+            .dst_access_mask(vk::AccessFlags::SHADER_WRITE);
+
+        device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::TOP_OF_PIPE,
+            vk::PipelineStageFlags::RAY_TRACING_SHADER_KHR,
+            vk::DependencyFlags::empty(),
+            &[] as &[vk::MemoryBarrier],
+            &[] as &[vk::BufferMemoryBarrier],
+            &[barrier],
+        );
+    }
+
+    device.end_command_buffer(cmd)?;
+    device.queue_submit(data.graphics_queue, &[vk::SubmitInfo::builder().command_buffers(&[cmd])], vk::Fence::null())?;
+    device.queue_wait_idle(data.graphics_queue)?;
+    device.free_command_buffers(data.command_pool, &[cmd]);
+
+    Ok(())
+}}
+
+unsafe fn create_accum_image(
+    instance: &Instance,
+    device: &Device,
+    data: &mut AppData,
+) -> Result<()> { unsafe {
+    data.accum_images.clear();
+    data.accum_image_memories.clear();
+    data.accum_image_views.clear();
+
+    for _ in 0..data.swapchain_images.len() {
+        let info = vk::ImageCreateInfo::builder()
+            .image_type(vk::ImageType::_2D)
+            .format(vk::Format::R32G32B32A32_SFLOAT)
+            .extent(vk::Extent3D {
+                width: data.swapchain_extent.width,
+                height: data.swapchain_extent.height,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::STORAGE) // no TRANSFER_SRC needed
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+
+        let image = device.create_image(&info, None)?;
+        let requirements = device.get_image_memory_requirements(image);
+
+        let memory_info = vk::MemoryAllocateInfo::builder()
+            .allocation_size(requirements.size)
+            .memory_type_index(get_memory_type_index(
+                instance, data, vk::MemoryPropertyFlags::DEVICE_LOCAL, requirements,
+            )?);
+
+        let memory = device.allocate_memory(&memory_info, None)?;
+        device.bind_image_memory(image, memory, 0)?;
+
+        let subresource_range = vk::ImageSubresourceRange::builder()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .base_mip_level(0)
+            .level_count(1)
+            .base_array_layer(0)
+            .layer_count(1);
+
+        let view_info = vk::ImageViewCreateInfo::builder()
+            .image(image)
+            .view_type(vk::ImageViewType::_2D)
+            .format(vk::Format::R32G32B32A32_SFLOAT)
+            .subresource_range(subresource_range);
+
+        let view = device.create_image_view(&view_info, None)?;
+
+        data.accum_images.push(image);
+        data.accum_image_memories.push(memory);
+        data.accum_image_views.push(view);
+    }
+
+
+    let alloc_info = vk::CommandBufferAllocateInfo::builder()
+        .level(vk::CommandBufferLevel::PRIMARY)
+        .command_pool(data.command_pool)
+        .command_buffer_count(1);
+
+    let cmd = device.allocate_command_buffers(&alloc_info)?[0];
+    device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
+
+    for &image in &data.accum_images {
         let barrier = vk::ImageMemoryBarrier::builder()
             .old_layout(vk::ImageLayout::UNDEFINED)
             .new_layout(vk::ImageLayout::GENERAL)
@@ -3457,9 +3459,16 @@ unsafe fn create_rt_pipeline(
         let groups = &[raygen_group, miss_group, shadow_miss_group, hit_group];
 
         // Layout pipeline
+        let push_constant_range = vk::PushConstantRange::builder()
+            .stage_flags(vk::ShaderStageFlags::RAYGEN_KHR)
+            .offset(0)
+            .size(size_of::<RtPushConstants>() as u32);
+
         let set_layouts = &[data.descriptor_set_layout];
+        let push_constant_ranges = &[push_constant_range];
         let layout_info = vk::PipelineLayoutCreateInfo::builder()
-            .set_layouts(set_layouts);
+            .set_layouts(set_layouts)
+            .push_constant_ranges(push_constant_ranges);
 
         data.rt_pipeline_layout = device.create_pipeline_layout(&layout_info, None)?;
 
@@ -3709,8 +3718,15 @@ unsafe fn create_descriptor_set_layout(
         .descriptor_count(1)
         .stage_flags(rt_stages);
 
-    let textures_binding = vk::DescriptorSetLayoutBinding::builder()
+    let accum_image_binding = vk::DescriptorSetLayoutBinding::builder()
         .binding(6)
+        .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+        .descriptor_count(1)
+        .stage_flags(rt_stages);
+
+    // MUST ALWAYS BE HIGHEST
+    let textures_binding = vk::DescriptorSetLayoutBinding::builder()
+        .binding(7)
         .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
         .descriptor_count(MAX_TEXTURES)
         .stage_flags(rt_stages);
@@ -3720,10 +3736,12 @@ unsafe fn create_descriptor_set_layout(
         as_binding, image_binding,
         ubo_binding, 
         object_descs_binding, materials_binding, material_ids_binding,
+        accum_image_binding,
         textures_binding,
     ];
 
     let binding_flags = &[
+        vk::DescriptorBindingFlags::empty(),
         vk::DescriptorBindingFlags::empty(),
         vk::DescriptorBindingFlags::empty(),
         vk::DescriptorBindingFlags::empty(),
@@ -3773,10 +3791,15 @@ unsafe fn create_descriptor_pool(device: &Device, data: &mut AppData) -> Result<
         .type_(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
         .descriptor_count(data.swapchain_images.len() as u32 * MAX_TEXTURES);
 
+    let accum_image_size = vk::DescriptorPoolSize::builder()
+        .type_(vk::DescriptorType::STORAGE_IMAGE)
+        .descriptor_count(data.swapchain_images.len() as u32);
+
 
     let pool_sizes = &[
         as_size, image_size, ubo_size, object_descs_size, materials_size, 
         storage_buffer_size, textures_size,
+        accum_image_size,
     ];
 
     let info = vk::DescriptorPoolCreateInfo::builder()
@@ -3916,11 +3939,27 @@ unsafe fn create_descriptor_sets(device: &Device, data: &mut AppData) -> Result<
         writes.push(material_ids_write);
 
 
+        // TA write
+        let accum_image_info = vk::DescriptorImageInfo::builder()
+            .image_layout(vk::ImageLayout::GENERAL)
+            .image_view(data.accum_image_views[i])
+            .build();
+
+        let accum_image_write = vk::WriteDescriptorSet::builder()
+            .dst_set(data.descriptor_sets[i])
+            .dst_binding(6)
+            .dst_array_element(0)
+            .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+            .image_info(std::slice::from_ref(&accum_image_info))
+            .build();
+        writes.push(accum_image_write);
+
+
         // Texture write
         if !texture_infos.is_empty() {
             let textures_write = vk::WriteDescriptorSet::builder()
                 .dst_set(data.descriptor_sets[i])
-                .dst_binding(6)
+                .dst_binding(7)
                 .dst_array_element(0)
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                 .image_info(&texture_infos)

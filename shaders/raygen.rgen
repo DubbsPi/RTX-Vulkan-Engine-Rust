@@ -5,7 +5,7 @@
 
 
 layout(binding = 0, set = 0) uniform accelerationStructureEXT topLevelAS;
-layout(binding = 1, set = 0, rgba8) uniform image2D outputImage;
+layout(binding = 1, set = 0, rgba16f) uniform image2D outputImage;
 
 layout(binding = 2, set = 0) uniform CameraUBO {
     mat4 viewInverse;
@@ -13,44 +13,94 @@ layout(binding = 2, set = 0) uniform CameraUBO {
     float time;
 } cam;
 
+layout(binding = 6, set = 0, rgba32f) uniform image2D accumImage;
 
-layout(location = 0) rayPayloadEXT vec3 hitColor;
 
+layout(push_constant) uniform PushConstants {
+    uint frameIndex;
+    uint accumulatedSamples;
+} pc;
+
+
+layout(location = 0) rayPayloadEXT RayPayload payload;
+
+
+#define MAX_SAMPLES 128
 
 void main() {
-    vec2 pixelCenter = vec2(gl_LaunchIDEXT.xy) + vec2(0.5);
+    ivec2 pixelCoord = ivec2(gl_LaunchIDEXT.xy);
+
+    payload.rngState = randInt(gl_LaunchIDEXT.xy, gl_LaunchSizeEXT.xy, pc.frameIndex);
+    vec2 jitter = vec2(rand(payload.rngState), rand(payload.rngState)) - 0.5;
+    vec2 pixelCenter = vec2(gl_LaunchIDEXT.xy) + vec2(0.5) + jitter;
+
     vec2 uv = pixelCenter / vec2(gl_LaunchSizeEXT.xy);
     vec2 ndc = uv * 2.0 - 1.0;
 
     vec4 origin = cam.viewInverse * vec4(0, 0, 0, 1);
-    vec4 target = cam.projInverse * vec4(ndc.x, ndc.y, 1, 1);
+    vec4 target = normalize(cam.projInverse * vec4(ndc.x, ndc.y, 1, 1));
     vec3 rayDirView = normalize(target.xyz / target.w);
-    vec4 direction = cam.viewInverse * vec4(rayDirView, 0);
 
-    hitColor = vec3(0, 0, 0);
 
-    traceRayEXT(
-        topLevelAS,
-        gl_RayFlagsNoneEXT,
-        0xFF,
-        0,
-        0,
-        0,
-        origin.xyz,
-        0.001,
-        direction.xyz,
-        10000.0,
-        0
-    );
-    
+    vec3 accumulatedColor = vec3(0);
+    vec3 throughput = vec3(1);
+
+    vec3 rayOrigin = origin.xyz;
+    vec3 rayDirection = normalize(cam.viewInverse * vec4(rayDirView, 0)).xyz;
+
+
+    for (int bounce = 0; bounce < MAX_BOUNCES; bounce++) {
+        payload.radiance = vec3(0);
+        payload.throughput = vec3(1);
+        payload.terminated = false;
+
+        traceRayEXT(
+            topLevelAS,
+            gl_RayFlagsNoneEXT,
+            0xFF, 0, 0, 0,
+            rayOrigin, 0.001,
+            rayDirection, 10000.0,
+            0
+        );
+
+        accumulatedColor += throughput * payload.radiance;
+
+        if (payload.terminated) break; 
+
+        throughput *= payload.throughput;
+
+        if (bounce > 1) {
+            float p = max(throughput.r, max(throughput.g, throughput.b));
+            if (rand(payload.rngState) > p) break;
+            throughput /= p;
+        }
+
+        rayOrigin = payload.nextOrigin;
+        rayDirection = payload.nextDirection;
+    }
+
+
+    vec3 historyColor = vec3(0);
+    if (pc.accumulatedSamples > 0) {
+        vec4 history = imageLoad(accumImage, pixelCoord);
+        historyColor = history.rgb;
+    }
+
+    // Running average
+    float weight = 1.0 / float(min(pc.accumulatedSamples, 1024) + 1);
+    vec3 newAccum = mix(historyColor, accumulatedColor, weight);
+
+    imageStore(accumImage, pixelCoord, vec4(newAccum, 1));
+
+    vec3 hitColor = newAccum;
 
     // Aces
     hitColor = (hitColor * (2.51 * hitColor + 0.03)) / (hitColor * (2.43 * hitColor + 0.59) + 0.14);
     hitColor = pow(clamp(hitColor, 0.0, 1.0), vec3(1.0 / 2.2));
 
-    // Dithering
     float dither = bayerDither(gl_LaunchIDEXT.xy);
-    hitColor += dither * 0.00392156862;
+    const float depth = 1.0 / 1023.0;
+    hitColor += dither * depth;
 
-    imageStore(outputImage, ivec2(gl_LaunchIDEXT.xy), vec4(hitColor, 1.0));
+    imageStore(outputImage, pixelCoord, vec4(hitColor, 1.0));
 }

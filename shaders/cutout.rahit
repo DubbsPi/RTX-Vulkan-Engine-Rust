@@ -9,7 +9,7 @@ hitAttributeEXT vec2 attribs;
 layout(binding = 3, set = 0, scalar) buffer ObjectDescs { ObjectDesc descs[]; };
 layout(binding = 4, set = 0, scalar) buffer Materials { Material mats[]; };
 layout(binding = 5, set = 0, scalar) buffer MaterialIDs { uint materialIds[]; };
-layout(binding = 6, set = 0) uniform sampler2D textures[];
+layout(binding = 7, set = 0) uniform sampler2D textures[];
 
 
 void main() {
