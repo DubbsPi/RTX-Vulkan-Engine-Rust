@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::fs::{self, File};
+use std::fs::File;
 
 use indexmap::IndexSet;
 
@@ -110,7 +110,7 @@ impl Scene {
         instance: &crate::Instance,
         device: &crate::Device,
         data: &mut crate::AppData,
-    ) -> Result<Model> {
+    ) -> Result<Model> { unsafe {
         use std::path::Path;
 
         let source_path = Path::new(path);
@@ -200,7 +200,7 @@ impl Scene {
             skeleton,
             animations: asset.animations,
         })
-    }
+    }}
 
     pub fn add_model_to_scene(&mut self, model: &Model, model_class: ModelClass, model_name: Option<String>) {
         let vertex_offset = self.vertices.len() as u32;
@@ -259,12 +259,9 @@ impl Scene {
 
 
     pub fn search_for_model_id(&self, model_name: String) -> Option<usize> {
-        if let Some(index) = self.model_names.get_index_of(&model_name) {
-            Some(index);
-        }
-        None
+        self.model_names.get_index_of(&model_name)
     }
-
+    
 
     pub fn translate_model(&mut self, model_id: usize, offset: Vec3) {
         self.transform_matrices[model_id] = Mat4::from_translation(offset) * self.transform_matrices[model_id];
@@ -471,96 +468,6 @@ fn compute_vertex_normals(positions: &[Vec3], indices: &[u32]) -> Vec<Vec3> {
     }
 
     normals
-}
-
-unsafe fn create_gltf_textures(
-    instance: &crate::Instance,
-    device: &crate::Device,
-    data: &crate::AppData,
-    images: &[gltf::image::Data],
-) -> Result<Vec<(crate::vk::Image, crate::vk::DeviceMemory, crate::vk::ImageView)>> {
-    unsafe {
-        let mut textures = Vec::new();
-
-        for img in images {
-            let vk_format = gltf_to_vulkan(img.format)
-                .ok_or_else(|| anyhow!("Unsupported glTF image format: {:?}", img.format))?;
-
-            let pixels: Vec<u8> = match img.format {
-                // 8 bit
-                gltf::image::Format::R8 => img.pixels.clone(),
-
-                gltf::image::Format::R8G8B8A8 => img.pixels.clone(),
-
-                gltf::image::Format::R8G8B8 => img.pixels
-                    .chunks_exact(3)
-                    .flat_map(|rgb| [rgb[0], rgb[1], rgb[2], 255u8])
-                    .collect(),
-
-                // 16 bit
-                gltf::image::Format::R16 => img.pixels.clone(),
-
-                gltf::image::Format::R16G16B16A16 => img.pixels.clone(),
-
-                gltf::image::Format::R16G16B16 => {
-                    let u16_pixels: &[u16] = bytemuck::cast_slice(&img.pixels);
-
-                    u16_pixels
-                        .chunks_exact(3)
-                        .flat_map(|rgb| [rgb[0], rgb[1], rgb[2], u16::MAX])
-                        .flat_map(|v| v.to_ne_bytes())
-                        .collect()
-                }
-
-                other => {
-                    return Err(anyhow!(
-                        "Unsupported glTF image format: {:?}",
-                        other
-                    ));
-                }
-            };
-
-            let (image, memory, view) = create_texture_image(
-                instance,
-                device,
-                data,
-                data.command_pool,
-                data.graphics_queue,
-                &pixels,
-                img.width,
-                img.height,
-                vk_format,
-            )?;
-
-            textures.push((image, memory, view));
-        }
-
-        Ok(textures)
-    }
-}
-
-fn gltf_to_vulkan(format: gltf::image::Format) -> Option<crate::vk::Format> {
-    match format {
-        crate::R8 =>
-            Some(crate::vk::Format::R8_UNORM),
-
-        crate::R8G8B8 =>
-            Some(crate::vk::Format::R8G8B8A8_SRGB),
-
-        crate::R8G8B8A8 =>
-            Some(crate::vk::Format::R8G8B8A8_SRGB),
-
-        crate::R16 =>
-            Some(crate::vk::Format::R16_UNORM),
-
-        crate::R16G16B16 =>
-            Some(crate::vk::Format::R16G16B16A16_UNORM),
-
-        crate::R16G16B16A16 =>
-            Some(crate::vk::Format::R16G16B16A16_UNORM),
-
-        _ => None,
-    }
 }
 
 unsafe fn create_texture_image(
@@ -934,6 +841,7 @@ fn write_i32(w: &mut impl Write, v: i32) -> io::Result<()> {
 fn write_f32(w: &mut impl Write, v: f32) -> io::Result<()> {
     w.write_all(&v.to_le_bytes())
 }
+
 
 fn read_u8(r: &mut impl Read) -> io::Result<u8> {
     let mut b = [0u8; 1];
@@ -1363,7 +1271,7 @@ unsafe fn create_cached_textures(
     device: &crate::Device,
     data: &crate::AppData,
     textures: &[CachedTexture],
-) -> Result<Vec<(crate::vk::Image, crate::vk::DeviceMemory, crate::vk::ImageView)>> {
+) -> Result<Vec<(crate::vk::Image, crate::vk::DeviceMemory, crate::vk::ImageView)>> { unsafe {
     let mut result = Vec::with_capacity(textures.len());
 
     for texture in textures {
@@ -1415,7 +1323,7 @@ unsafe fn create_cached_textures(
     }
 
     Ok(result)
-}
+}}
 
 fn write_texture(
     w: &mut impl Write,
@@ -1700,6 +1608,7 @@ pub fn load_cached_asset(path: &std::path::Path) -> Result<CachedAsset> {
             CACHE_VERSION
         ));
     }
+    
 
     // Dependencies
     let dependency_count = read_u64(&mut file)? as usize;
@@ -1709,6 +1618,24 @@ pub fn load_cached_asset(path: &std::path::Path) -> Result<CachedAsset> {
         let _size = read_u64(&mut file)?;
         let _seconds = read_u64(&mut file)?;
         let _nanos = read_u32(&mut file)?;
+    }
+
+    // Magic 2
+    let mut data_magic = [0u8; 8];
+    file.read_exact(&mut data_magic)?;
+
+    if &data_magic != CACHE_MAGIC {
+        return Err(anyhow!("Invalid cache data-section magic"));
+    }
+
+    let data_version = read_u32(&mut file)?;
+
+    if data_version != CACHE_VERSION {
+        return Err(anyhow!(
+            "Unsupported cache data section version {} (expected {})",
+            data_version,
+            CACHE_VERSION
+        ));
     }
 
     // Vertices
@@ -1777,12 +1704,6 @@ pub fn load_cached_asset(path: &std::path::Path) -> Result<CachedAsset> {
         skeleton,
         animations,
     })
-}
-
-fn cache_path(source: &Path) -> PathBuf {
-    let mut path = source.to_path_buf();
-    path.set_extension("cache");
-    path
 }
 
 fn cache_path_for(source: &Path) -> PathBuf {

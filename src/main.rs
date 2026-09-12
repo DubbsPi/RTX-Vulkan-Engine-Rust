@@ -30,8 +30,6 @@ use cgmath::{Deg, Point3, vec3};
 use cgmath::SquareMatrix;
 use cgmath::InnerSpace;
 
-use gltf::image::Format::*;
-
 mod common;
 use common::Vertex;
 use common::Material;
@@ -80,12 +78,6 @@ unsafe fn create_scene(instance: &Instance, device: &Device, data: &mut AppData,
             &instance, &device, data,
         )?;
 
-        let interior = Scene::load_model_into_memory(
-            &mut scene,
-            "models/interior.glb",
-            instance, device, data
-        )?;
-
 
         scene.add_model_to_scene(&magazine, ModelClass::Static, None);
         scene.add_model_to_scene(&magazine, ModelClass::Static, None);
@@ -98,9 +90,6 @@ unsafe fn create_scene(instance: &Instance, device: &Device, data: &mut AppData,
 
         scene.add_model_to_scene(&protogen, ModelClass::Dynamic, Some("Xenon".to_owned()));
         scene.translate_model(2, vec3(-4.0, 0.0, 0.0));
-    
-        scene.add_model_to_scene(&interior, ModelClass::Static, Some("House".to_owned()));
-        scene.scale_model(3, vec3(0.005, 0.005, 0.005));
     }
 
     Ok(scene)
