@@ -1,0 +1,167 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+
+#include "common.glsl"
+
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(binding = 1, set = 0, rgba16f) uniform image2D outputImage;
+layout(binding = 6, set = 0, rgba32f) uniform image2D accumImage;
+
+
+const float kernel[25] = float[](
+    1.0/256.0, 4.0/256.0, 6.0/256.0, 4.0/256.0, 1.0/256.0,
+    4.0/256.0, 16.0/256.0, 24.0/256.0, 16.0/256.0, 4.0/256.0,
+    6.0/256.0, 24.0/256.0, 36.0/256.0, 24.0/256.0, 6.0/256.0,
+    4.0/256.0, 16.0/256.0, 24.0/256.0, 16.0/256.0, 4.0/256.0,
+    1.0/256.0, 4.0/256.0, 6.0/256.0, 4.0/256.0, 1.0/256.0
+);
+
+
+bool finiteFloat(in float v) {
+    return !isnan(v) && !isinf(v);
+}
+
+bool finiteVec3(in vec3 v) {
+    return all(not(isnan(v))) && all(not(isinf(v)));
+}
+
+vec3 sanitizeColor(in vec3 c) {
+    if (!finiteVec3(c))
+        return vec3(0.0);
+    return max(c, vec3(0.0));
+}
+
+vec4 filterPass(ivec2 pixel, ivec2 size, int stepSize) {
+    vec4 centerRaw = imageLoad(accumImage, pixel);
+
+    vec3 centerColor = sanitizeColor(centerRaw.rgb);
+    float centerLum = luminance(centerColor);
+
+    float centerDepth = finiteFloat(centerRaw.a)? centerRaw.a : 0.0;
+
+    vec3 sum = vec3(0.0);
+    float weightSum = 0.0;
+
+    int kernelIdx = 0;
+
+    for (int y = -2; y <= 2; y++) {
+        for (int x = -2; x <= 2; x++) {
+            ivec2 p = clamp(pixel + ivec2(x, y) * stepSize, ivec2(0), size - 1);
+
+            vec4 cRaw = imageLoad(accumImage, p);
+
+            // Reject broken samples
+            if (!finiteVec3(cRaw.rgb) || !finiteFloat(cRaw.a)) {
+                kernelIdx++;
+                continue;
+            }
+
+            vec3 c = max(cRaw.rgb, vec3(0.0));
+
+            float lum = luminance(c);
+            float depth = cRaw.a;
+
+            if (!finiteFloat(lum)) {
+                kernelIdx++;
+                continue;
+            }
+
+            float lumDiff = abs(lum - centerLum) / max(centerLum, 0.1);
+            float normalizedDepthDiff = abs(depth - centerDepth) / max(abs(centerDepth), 1.0);
+
+            normalizedDepthDiff = clamp(normalizedDepthDiff, 0.0, 1.0);
+
+            float lumWeight = exp(-lumDiff * lumDiff * 8.0);
+            float depthWeight = exp(-normalizedDepthDiff * normalizedDepthDiff * DEPTH_WEIGHT_SCALE * DEPTH_SENSITIVITY);
+
+            float w = kernel[kernelIdx];
+            float weight = w * lumWeight * depthWeight;
+
+            if (!finiteFloat(weight) || weight <= 0.0) {
+                kernelIdx++;
+                continue;
+            }
+
+            sum += c * weight;
+            weightSum += weight;
+
+            kernelIdx++;
+        }
+    }
+
+    if (!finiteVec3(sum) || !finiteFloat(weightSum) || weightSum <= 0.0)
+        return vec4(centerColor, centerDepth);
+
+    vec3 result = sum / weightSum;
+
+    if (!finiteVec3(result))
+        result = centerColor;
+
+    return vec4(result, centerDepth);
+}
+
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(accumImage);
+
+    if (pixel.x >= size.x || pixel.y >= size.y)
+        return;
+
+    vec4 result = imageLoad(accumImage, pixel);
+    
+    result = filterPass(pixel, size, 1);
+    
+    vec3 denoised = result.rgb;
+    
+    // Firefly suppression
+    vec4 centerOrigin = imageLoad(accumImage, pixel);
+    float minLum = luminance(centerOrigin.rgb);
+    float maxLum = luminance(centerOrigin.rgb);
+    
+    for (int y = -1; y <= 1; y++) {
+        for (int x = -1; x <= 1; x++) {
+            if (x == 0 && y == 0) continue;
+            
+            ivec2 p = clamp(
+                pixel + ivec2(x, y),
+                ivec2(0),
+                size - 1
+            );
+            vec4 c = imageLoad(accumImage, p);
+            float lum = luminance(c.rgb);
+            minLum = min(minLum, lum);
+            maxLum = max(maxLum, lum);
+        }
+    }
+    
+    float denoisedLum = luminance(denoised);
+    vec3 clampedDenoised = denoised;
+
+    float minAllowed = minLum * 0.25;
+    float maxAllowed = maxLum * 1.5;
+
+    if (denoisedLum > maxAllowed)
+        clampedDenoised = denoised * (maxAllowed / denoisedLum);
+    
+    else if (denoisedLum < minAllowed && denoisedLum > 0.0001)
+        clampedDenoised = denoised * (minAllowed / denoisedLum);
+    
+    
+    vec3 finalColor = mix(centerOrigin.rgb, clampedDenoised, denoiseStrength);
+    
+    // Aces
+    finalColor = (finalColor * (2.51 * finalColor + 0.03)) / (finalColor * (2.43 * finalColor + 0.59) + 0.14);
+
+    // Gamma correction
+    finalColor = pow(clamp(finalColor, 0.0, 1.0), vec3(0.454545455));
+
+    // Dithering
+    float dither = bayerDither(pixel);
+    const float depth = 1.0 / 1023.0;
+    finalColor += dither * depth;
+
+    imageStore(outputImage, pixel, vec4(finalColor, 1.0));
+}

@@ -14,7 +14,14 @@
 #define TAU 6.28318530718
 
 
+const float denoiseStrength = 1.0;
+#define DEPTH_WEIGHT_SCALE 3.0 
+#define DEPTH_SENSITIVITY 0.5
+
+
 const vec3 sunLightDir = normalize(vec3(-0.4, 1, 0.2));
+const vec3 sunLightColor = vec3(1);
+const float sunAngularRadius = 0.01;
 
 #define SKY_VIEW_SAMPLES 12
 #define SKY_LIGHT_SAMPLES 6
@@ -38,6 +45,7 @@ const float maxFogDist = 100.0;
 
 
 const int MAX_BOUNCES = 8;
+const int MAX_ACCUMULATION = 512;
 
 
 struct Vertex {
@@ -177,10 +185,10 @@ vec3 scatterAtmosphere(in vec3 viewDir, in vec3 sunDir, in float cameraY) {
 
 vec3 getSky(in vec3 rayDir, in vec3 sunDir, in float cameraY) {
     rayDir.y = max(rayDir.y, -0.25);
-    
-	vec3 skyColor = scatterAtmosphere(rayDir, sunDir, cameraY);
-    
-    float sunDisc = smoothstep(0.9999, 1.0, dot(rayDir, sunDir));
+    vec3 skyColor = scatterAtmosphere(rayDir, sunDir, cameraY);
+
+    const float cosAngularRadius = cos(sunAngularRadius);
+    float sunDisc = smoothstep(cosAngularRadius - 0.0001, cosAngularRadius, dot(rayDir, sunDir));
     skyColor += sunIntensity * sunDisc * smoothstep(0.0, 1.0, sunDir.y);
 
     return skyColor;
@@ -323,6 +331,35 @@ vec3 sampleGGX(inout uint seed, in vec3 normal, in float roughness) {
     vec3 bitangent = cross(normal, tangent);
 
     return normalize(tangent * H_tangent.x + bitangent * H_tangent.y + normal * H_tangent.z);
+}
+
+vec3 fresnelSchlick(in float cosTheta, in vec3 F0) {
+    return F0 + (1.0 - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
+}
+
+
+vec3 sampleSunCone(inout uint rngState, in vec3 sunDir, in float sunAngularRadius) {
+    float cosThetaMax = cos(sunAngularRadius);
+    float xi1 = rand(rngState);
+    float xi2 = rand(rngState);
+
+    float cosTheta = 1.0 - xi1 * (1.0 - cosThetaMax);
+    float sinTheta = sqrt(max(0.0, 1.0 - cosTheta * cosTheta));
+    float phi = 2.0 * PI * xi2;
+
+    float signy = sunDir.z >= 0.0 ? 1.0 : -1.0;
+    float a = -1.0 / (signy + sunDir.z);
+    float b = sunDir.x * sunDir.y * a;
+    vec3 tangent = vec3(1.0 + signy * sunDir.x * sunDir.x * a, signy * b, -signy * sunDir.x);
+    vec3 bitangent = vec3(b, signy + sunDir.y * sunDir.y * a, -sunDir.y);
+
+    vec3 localDir = vec3(cos(phi) * sinTheta, sin(phi) * sinTheta, cosTheta);
+    return normalize(tangent * localDir.x + bitangent * localDir.y + sunDir * localDir.z);
+}
+
+
+float luminance(in vec3 c) {
+    return dot(c, vec3(0.2126, 0.7152, 0.0722));
 }
 
 

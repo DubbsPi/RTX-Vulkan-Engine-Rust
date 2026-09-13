@@ -7,3 +7,5 @@ glslc -I./shaders/include --target-spv=spv1.4 -fshader-stage=rmiss shaders/shado
 glslc -I./shaders/include --target-spv=spv1.4 shaders/skin.comp -o shaders/skin.spv
 
 glslc -I./shaders/include --target-spv=spv1.4 -fshader-stage=rahit shaders/cutout.rahit -o shaders/cutout.spv
+
+glslc -I./shaders/include --target-spv=spv1.4 shaders/denoise.comp -o shaders/denoise.spv

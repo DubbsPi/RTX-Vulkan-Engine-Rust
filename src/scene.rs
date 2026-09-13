@@ -12,6 +12,8 @@ use indexmap::IndexSet;
 use cgmath::SquareMatrix;
 use cgmath::vec3;
 use cgmath::Quaternion;
+use cgmath::Matrix;
+use cgmath::InnerSpace;
 
 
 use anyhow::{anyhow, Context, Result};
@@ -21,6 +23,8 @@ use vulkanalia::vk::DeviceV1_0;
 use vulkanalia::vk::HasBuilder;
 use vulkanalia::vk::Handle;
 
+
+use crate::StringOrInt;
 
 use crate::common::Vertex;
 use crate::common::Material;
@@ -263,29 +267,96 @@ impl Scene {
     }
     
 
-    pub fn translate_model(&mut self, model_id: usize, offset: Vec3) {
-        self.transform_matrices[model_id] = Mat4::from_translation(offset) * self.transform_matrices[model_id];
+    pub fn translate_model(&mut self, model_id: StringOrInt, offset: Vec3) {
+        let model_index = match model_id {
+            StringOrInt::Str(s) => {
+                if let Some(i) = self.search_for_model_id(s) {
+                    i
+                } else {
+                    return
+                }
+            },
+            StringOrInt::Int(i) => i,
+        };
+
+        self.transform_matrices[model_index] = Mat4::from_translation(offset) * self.transform_matrices[model_index];
     }
 
-    pub fn scale_model(&mut self, model_id: usize, scale: Vec3) {
-        self.transform_matrices[model_id] = Mat4::from_nonuniform_scale(scale.x, scale.y, scale.z) * self.transform_matrices[model_id];
+    pub fn scale_model(&mut self, model_id: StringOrInt, scale: Vec3) {
+        let model_index = match model_id {
+            StringOrInt::Str(s) => {
+                if let Some(i) = self.search_for_model_id(s) {
+                    i
+                } else {
+                    return
+                }
+            },
+            StringOrInt::Int(i) => i,
+        };
+
+        self.transform_matrices[model_index] = Mat4::from_nonuniform_scale(scale.x, scale.y, scale.z) * self.transform_matrices[model_index];
     }
 
-    pub fn set_transform(&mut self, model_id: usize, transform: Mat4) {
-        self.transform_matrices[model_id] = transform;
+    pub fn set_transform(&mut self, model_id: StringOrInt, transform: Mat4) {
+        let model_index = match model_id {
+            StringOrInt::Str(s) => {
+                if let Some(i) = self.search_for_model_id(s) {
+                    i
+                } else {
+                    return
+                }
+            },
+            StringOrInt::Int(i) => i,
+        };
+
+        self.transform_matrices[model_index] = transform;
     }
 }
 
 
-fn load_gltf(path: &str) -> Result<(Vec<Vertex>, Vec<u32>, Vec<u32>, Vec<Material>,Vec<Data>, Option<Skeleton>, Vec<AnimationClip>)> {
+fn load_gltf(path: &str) -> Result<(Vec<Vertex>, Vec<u32>, Vec<u32>, Vec<Material>, Vec<Data>, Option<Skeleton>, Vec<AnimationClip>)> {
     let (document, buffers, images) = gltf::import(path)?;
 
     let mut vertices = Vec::new();
     let mut indices = Vec::new();
     let mut material_ids = Vec::new();
 
+    for scene in document.scenes() {
+        for node in scene.nodes() {
+            walk_node(&node, Mat4::identity(), &buffers, &mut vertices, &mut indices, &mut material_ids);
+        }
+    }
 
-    for mesh in document.meshes() {
+    let skeleton = extract_skeleton(&document, &buffers);
+    let materials = convert_materials(&document);
+    let animations = match &skeleton {
+        Some(skel) => extract_animations(&document, &buffers, skel),
+        None => Vec::new(),
+    };
+
+    Ok((vertices, indices, material_ids, materials, images, skeleton, animations))
+}
+
+fn node_local_matrix(node: &gltf::Node) -> Mat4 {
+    let (t, r, s) = node.transform().decomposed();
+    Mat4::from_translation(vec3(t[0], t[1], t[2]))
+        * Mat4::from(cgmath::Quaternion::new(r[3], r[0], r[1], r[2]))
+        * Mat4::from_nonuniform_scale(s[0], s[1], s[2])
+}
+
+fn walk_node(
+    node: &gltf::Node,
+    parent_world: Mat4,
+    buffers: &[gltf::buffer::Data],
+    vertices: &mut Vec<Vertex>,
+    indices: &mut Vec<u32>,
+    material_ids: &mut Vec<u32>,
+) {
+    let world = parent_world * node_local_matrix(node);
+
+    let normal_mat = world.invert().map(|m| m.transpose()).unwrap_or(world);
+
+    if let Some(mesh) = node.mesh() {
         for primitive in mesh.primitives() {
             if primitive.mode() != gltf::mesh::Mode::Triangles {
                 warn!("Skipping non-triangle primitive in mesh {:?}", mesh.name());
@@ -296,14 +367,21 @@ fn load_gltf(path: &str) -> Result<(Vec<Vertex>, Vec<u32>, Vec<u32>, Vec<Materia
 
             let positions: Vec<Vec3> = reader
                 .read_positions()
-                .ok_or_else(|| anyhow!("Primitive missing POSITION attribute"))?
-                .map(|p| vec3(p[0], p[1], p[2]))
+                .expect("Primitive missing POSITION attribute")
+                .map(|p| {
+                    let world_p = world * cgmath::Vector4::new(p[0], p[1], p[2], 1.0);
+                    vec3(world_p.x, world_p.y, world_p.z)
+                })
                 .collect();
 
             let normals = match reader.read_normals() {
-                Some(iter) => iter.map(|n| vec3(n[0], n[1], n[2])).collect(),
+                Some(iter) => iter
+                    .map(|n| {
+                        let world_n = normal_mat * cgmath::Vector4::new(n[0], n[1], n[2], 0.0);
+                        vec3(world_n.x, world_n.y, world_n.z).normalize()
+                    })
+                    .collect(),
                 None => {
-                    // Fall back to flat shading
                     let raw_indices: Vec<u32> = reader
                         .read_indices()
                         .map(|i| i.into_u32().collect())
@@ -312,25 +390,25 @@ fn load_gltf(path: &str) -> Result<(Vec<Vertex>, Vec<u32>, Vec<u32>, Vec<Materia
                 }
             };
 
-            let uvs: Vec<Option<cgmath::Vector2<f32>>> = match reader.read_tex_coords(0) {
+                        let uvs: Vec<Option<cgmath::Vector2<f32>>> = match reader.read_tex_coords(0) {
                 Some(read_tex_coords) => read_tex_coords
                     .into_f32()
                     .map(|uv| Some(cgmath::vec2(uv[0], uv[1])))
                     .collect(),
                 None => vec![None; positions.len()],
             };
-
+ 
             let joint_indices: Vec<[u16; 4]> = match reader.read_joints(0) {
                 Some(read_joints) => read_joints.into_u16().collect(),
                 None => vec![[0, 0, 0, 0]; positions.len()],
             };
-
+ 
             let joint_weights: Vec<[f32; 4]> = match reader.read_weights(0) {
                 Some(read_weights) => read_weights.into_f32().collect(),
                 None => vec![[1.0, 0.0, 0.0, 0.0]; positions.len()],
             };
-
-
+ 
+ 
             let vertex_offset = vertices.len() as u32;
             vertices.extend(
                 positions.iter()
@@ -340,32 +418,24 @@ fn load_gltf(path: &str) -> Result<(Vec<Vertex>, Vec<u32>, Vec<u32>, Vec<Materia
                     .zip(joint_weights.iter())
                     .map(|((((&p, &n), &uv), &ji), &jw)| Vertex::new(p, n, uv, Some(ji), Some(jw))),
             );
-
+ 
             let prim_indices: Vec<u32> = match reader.read_indices() {
                 Some(iter) => iter.into_u32().map(|i| i + vertex_offset).collect(),
                 None => (0..positions.len() as u32).map(|i| i + vertex_offset).collect(),
             };
-
+ 
             let mat_id = primitive.material().index().unwrap_or(0) as u32;
             let triangle_count = prim_indices.len() / 3;
             material_ids.extend(std::iter::repeat(mat_id).take(triangle_count));
-
+ 
             indices.extend(prim_indices);
         }
     }
 
-
-    let skeleton = extract_skeleton(&document, &buffers);
-    let materials = convert_materials(&document);
-    let animations = match &skeleton {
-        Some(skel) => extract_animations(&document, &buffers, skel),
-        None => Vec::new(),
-    };
-
-    
-    Ok((vertices, indices, material_ids, materials, images, skeleton, animations))
+    for child in node.children() {
+        walk_node(&child, world, buffers, vertices, indices, material_ids);
+    }
 }
-
 fn convert_materials(document: &Document) -> Vec<Material> {
     document
         .materials()
@@ -748,7 +818,7 @@ impl Hash for Material {
 
 // Model caching
 const CACHE_MAGIC: &[u8; 8] = b"JMCACHE\0";
-const CACHE_VERSION: u32 = 2;
+const CACHE_VERSION: u32 = 0;
 
 #[derive(Clone)]
 pub struct CachedTexture {

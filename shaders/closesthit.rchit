@@ -80,27 +80,26 @@ void main() {
     }
 
     
+    vec3 sunDirSample = sampleSunCone(payload.rngState, sunLightDir, sunAngularRadius);
+
     vec3 V = -gl_WorldRayDirectionEXT;
-    vec3 H = normalize(V + sunLightDir);
+    vec3 H = normalize(V + sunDirSample);
     float NdotV = max(dot(normal, V), 0.0001);
-    float NdotL = dot(normal, sunLightDir);
+    float NdotL = dot(normal, sunDirSample);
     float NdotH = max(dot(normal, H), 0.0);
     float VdotH = max(dot(V, H), 0.0);
 
-
     float shadowFactor = 1.0;
     if (NdotL > 0.0) {
-        // Trace shadow ray
         shadowed = true;
         traceRayEXT(
             topLevelAS,
             gl_RayFlagsCullBackFacingTrianglesEXT | gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
             0xFF, 0, 0, 1,
             hitPos + geometricNormal * 0.001,
-            0.001, sunLightDir, 10000.0, 1
+            0.001, sunDirSample, 10000.0, 1
         );
-
-        shadowFactor = shadowed? 0.05 : 1.0;
+        shadowFactor = shadowed ? 0.0 : 1.0;
     }
 
     NdotL = max(NdotL, 0.001);
