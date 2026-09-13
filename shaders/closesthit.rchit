@@ -107,7 +107,7 @@ void main() {
 
 
     const float invPi = 1.0 / PI;
-    const vec3 lightColor = vec3(1);
+    const vec3 lightColor = sunLightColor;
 
     vec3 F0 = mix(vec3(0.08 * mat.specular), albedo, mat.metallic);
 
