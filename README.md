@@ -5,7 +5,7 @@ A hardware-accelerated path tracer built from scratch in **Rust** on top of **Vu
 > **Status: v0.1** -- Works fairly well, but there are performance improvements that still need to happen along with making the denoising even better, probably with some of Nvidia's AI tech
 
 <p align="center">
-  <img src="docs/convergence.gif" alt="Path trace converging from noise to a clean image" width="720">
+  <img src="pt.gif" alt="Path trace converging from noise to a clean image" width="720">
 </p>
 
 ## What it actually does
