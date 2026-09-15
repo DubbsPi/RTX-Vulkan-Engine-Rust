@@ -51,6 +51,7 @@ cargo run --release
 
 **Requirements:**
 - A GPU with hardware ray tracing support
+- Potentially WSL if the windows version does not work
   (*For Compiling*)
 - Vulkan SDK
 - Rust (stable)
