@@ -22,5 +22,5 @@ void main() {
     //mat2x3 fog = marchFog(camPos, gl_WorldRayDirectionEXT, gl_RayTmaxEXT);
     
     payload.radiance = sky;// * fog[1] + fog[0];
-    payload.terminated = true;
+    payload.nextDirEnc = vec2(10);
 }

@@ -436,6 +436,7 @@ fn walk_node(
         walk_node(&child, world, buffers, vertices, indices, material_ids);
     }
 }
+
 fn convert_materials(document: &Document) -> Vec<Material> {
     document
         .materials()

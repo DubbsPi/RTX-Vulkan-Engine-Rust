@@ -109,10 +109,8 @@ void main() {
 
     if (pixel.x >= size.x || pixel.y >= size.y)
         return;
-
-    vec4 result = imageLoad(accumImage, pixel);
     
-    result = filterPass(pixel, size, 1);
+    vec4 result = filterPass(pixel, size, 1);
     
     vec3 denoised = result.rgb;
     

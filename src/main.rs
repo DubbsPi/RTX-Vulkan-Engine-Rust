@@ -79,6 +79,11 @@ unsafe fn create_scene(instance: &Instance, device: &Device, data: &mut AppData,
             "models/Xenon.glb",
             &instance, &device, data,
         )?;
+        let room = Scene::load_model_into_memory(
+            &mut scene,
+            "models/Test_Room.glb",
+            &instance, &device, data,
+        )?;
 
 
         scene.add_model_to_scene(&magazine, ModelClass::Static, None);
@@ -92,6 +97,9 @@ unsafe fn create_scene(instance: &Instance, device: &Device, data: &mut AppData,
 
         scene.add_model_to_scene(&protogen, ModelClass::Dynamic, Some("Xenon".to_owned()));
         scene.translate_model(StringOrInt::Str("Xenon".to_owned()), vec3(-4.0, 0.0, 0.0));
+
+        scene.add_model_to_scene(&room, ModelClass::Dynamic, Some("Room".to_owned()));
+        scene.translate_model(StringOrInt::Str("Room".to_owned()), vec3(0.0, -5.0, 8.0));
     }
 
     Ok(scene)
@@ -648,6 +656,7 @@ impl App {
             self.device.destroy_buffer(buffer, None);
         }
         for memory in self.data.uniform_buffers_memory.drain(..) {
+            self.device.unmap_memory(memory);
             self.device.free_memory(memory, None);
         }
 
@@ -981,7 +990,7 @@ impl App {
 
         // Submit
         let wait_semaphores = &[self.data.image_available_semaphores[self.frame]];
-        let wait_stages = &[vk::PipelineStageFlags::ACCELERATION_STRUCTURE_BUILD_KHR];
+        let wait_stages = &[vk::PipelineStageFlags::TRANSFER];
 
         let command_buffers = &[cmd];
         let signal_semaphores = &[self.data.render_finished_semaphores[image_index]];
@@ -1066,40 +1075,20 @@ impl App {
     unsafe fn update_uniform_buffer(&self, image_index: usize) -> Result<()> { unsafe {
         let time = self.start.elapsed().as_secs_f32();
         let view = self.camera.view_matrix();
-
-        let mut proj = cgmath::perspective(
-            Deg(45.0),
-            self.data.swapchain_extent.width as f32 / self.data.swapchain_extent.height as f32,
-            0.1,
-            100.0,
-        );
-
-        proj[1][1] *= -1.0; // Invert Y for Vulkan coordinate space
-
-        let view_inverse = view.invert().ok_or_else(|| anyhow!("Failed to invert view matrix"))?;
-        let proj_inverse = proj.invert().ok_or_else(|| anyhow!("Failed to invert proj matrix"))?;
+        let mut proj = cgmath::perspective(Deg(45.0), self.data.swapchain_extent.width as f32 / self.data.swapchain_extent.height as f32, 0.1, 100.0);
+        proj[1][1] *= -1.0;
 
         let ubo = CameraUniformBufferObject {
-            view_inverse, proj_inverse,
-            time
+            view_inverse: view.invert().ok_or_else(|| anyhow!("Failed to invert view matrix"))?,
+            proj_inverse: proj.invert().ok_or_else(|| anyhow!("Failed to invert proj matrix"))?,
+            time,
         };
-
-        let memory = self.device.map_memory(
-            self.data.uniform_buffers_memory[image_index],
-            0,
-            size_of::<CameraUniformBufferObject>() as u64,
-            vk::MemoryMapFlags::empty(),
-        )?;
 
         memcpy(
             (&ubo as *const CameraUniformBufferObject).cast::<u8>(),
-            memory.cast::<u8>(),
+            self.data.uniform_buffers_mapped[image_index],
             size_of::<CameraUniformBufferObject>(),
         );
-
-        self.device.unmap_memory(self.data.uniform_buffers_memory[image_index]);
-        
-        
         Ok(())
     }}
 
@@ -1585,38 +1574,25 @@ impl App {
 
 
     unsafe fn refit_group(&mut self, cmd: vk::CommandBuffer, kind: GroupKind, mode: vk::BuildAccelerationStructureModeKHR) { unsafe {
-        let sources: Vec<GeomSource> = {
-            let group = self.group_ref(kind);
-            if group.members.is_empty() { return; }
-            group.members.iter().map(|&mi| geom_source_for(&self.device, &self.data, mi)).collect()
-        };
-        let geometries: Vec<_> = sources.iter().map(triangles_geometry).collect();
-        let range_infos: Vec<_> = sources.iter().map(|s| {
-            vk::AccelerationStructureBuildRangeInfoKHR::builder()
-                .primitive_count(s.triangle_count).primitive_offset(0).first_vertex(0).transform_offset(0)
-                .build()
-        }).collect();
-
         let group = self.group_ref(kind);
+        if group.members.is_empty() { return; }
+
         let mut build_info = vk::AccelerationStructureBuildGeometryInfoKHR::builder()
             .type_(vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL)
-            .flags(
-                vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE
-                | vk::BuildAccelerationStructureFlagsKHR::ALLOW_UPDATE
-            )
+            .flags(vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE | vk::BuildAccelerationStructureFlagsKHR::ALLOW_UPDATE)
             .mode(mode)
-            .geometries(&geometries)
+            .geometries(&group.cached_geometries)
             .dst_acceleration_structure(group.blas)
-            .scratch_data(vk::DeviceOrHostAddressKHR {
-                device_address: group.scratch_addr
-            });
+            .scratch_data(vk::DeviceOrHostAddressKHR { device_address: group.scratch_addr });
 
         if mode == vk::BuildAccelerationStructureModeKHR::UPDATE {
             build_info = build_info.src_acceleration_structure(group.blas);
         }
 
-        let range_refs: Vec<&[_]> = vec![&range_infos[..]];
-        self.device.cmd_build_acceleration_structures_khr(cmd, &[build_info], &range_refs);
+        let ranges_slice = group.cached_range_infos.as_slice();
+        let range_refs = std::slice::from_ref(&ranges_slice);
+
+        self.device.cmd_build_acceleration_structures_khr(cmd, &[build_info], range_refs);
     }}
 
     fn group_ref(&self, kind: GroupKind) -> &ClassGroup {
@@ -1788,6 +1764,8 @@ struct AppData {
     swapchain_extent: vk::Extent2D,
     swapchain_image_views: Vec<vk::ImageView>,
 
+    uniform_buffers_mapped: Vec<*mut u8>,
+
     // Storage images
     storage_images: Vec<vk::Image>,
     storage_image_memories: Vec<vk::DeviceMemory>,
@@ -1935,6 +1913,8 @@ struct ClassGroup {
     scratch_addr: vk::DeviceAddress,
     members: Vec<usize>,
     instance_custom_base: u32,
+    cached_geometries: Vec<vk::AccelerationStructureGeometryKHR>,
+    cached_range_infos: Vec<vk::AccelerationStructureBuildRangeInfoKHR>,
 }
 
 struct GeomSource {
@@ -3095,28 +3075,24 @@ unsafe fn get_buffer_device_address(
     device.get_buffer_device_address(&info)
 }}
 
-unsafe fn create_uniform_buffers(
-    instance: &Instance,
-    device: &Device,
-    data: &mut AppData,
-) -> Result<()> { unsafe {
+unsafe fn create_uniform_buffers(instance: &Instance, device: &Device, data: &mut AppData) -> Result<()> { unsafe {
     data.uniform_buffers.clear();
     data.uniform_buffers_memory.clear();
+    data.uniform_buffers_mapped.clear();
 
     for _ in 0..data.swapchain_images.len() {
-        let (uniform_buffer, uniform_buffer_memory) = create_buffer(
-            instance,
-            device,
-            data,
+        let (buf, mem) = create_buffer(
+            instance, device, data,
             size_of::<CameraUniformBufferObject>() as u64,
             vk::BufferUsageFlags::UNIFORM_BUFFER,
             vk::MemoryPropertyFlags::HOST_COHERENT | vk::MemoryPropertyFlags::HOST_VISIBLE,
         )?;
+        let mapped = device.map_memory(mem, 0, size_of::<CameraUniformBufferObject>() as u64, vk::MemoryMapFlags::empty())? as *mut u8;
 
-        data.uniform_buffers.push(uniform_buffer);
-        data.uniform_buffers_memory.push(uniform_buffer_memory);
+        data.uniform_buffers.push(buf);
+        data.uniform_buffers_memory.push(mem);
+        data.uniform_buffers_mapped.push(mapped);
     }
-
     Ok(())
 }}
 
@@ -3285,13 +3261,11 @@ unsafe fn rebuild_group_cold(
     device.free_command_buffers(data.command_pool, &[cmd]);
 
     Ok(ClassGroup {
-        blas,
-        buffer: as_buffer,
-        buffer_memory: as_buffer_memory,
-        scratch_buffer,
-        scratch_buffer_memory,
-        scratch_addr, members,
-        instance_custom_base
+        blas, buffer: as_buffer, buffer_memory: as_buffer_memory,
+        scratch_buffer, scratch_buffer_memory, scratch_addr, members,
+        instance_custom_base,
+        cached_geometries: geometries,
+        cached_range_infos: range_infos,
     })
 }}
 

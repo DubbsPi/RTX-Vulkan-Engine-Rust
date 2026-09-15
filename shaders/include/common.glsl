@@ -23,8 +23,8 @@ const vec3 sunLightDir = normalize(vec3(-0.4, 1, 0.2));
 const vec3 sunLightColor = vec3(1);
 const float sunAngularRadius = 0.01;
 
-#define SKY_VIEW_SAMPLES 12
-#define SKY_LIGHT_SAMPLES 6
+#define SKY_VIEW_SAMPLES 16
+#define SKY_LIGHT_SAMPLES 8
 
 const float sunIntensity  = 15.0;
 const float earthRadius  = 6371000.0;
@@ -44,8 +44,9 @@ const float hm = 1200.0;
 const float maxFogDist = 100.0;
 
 
-const int MAX_BOUNCES = 8;
-const int MAX_ACCUMULATION = 512;
+const int MAX_BOUNCES = 6;
+const int MAX_ACCUMULATION = 1024;
+const float maxWeight = 5.0;
 
 
 struct Vertex {
@@ -63,9 +64,8 @@ struct RayPayload {
     vec3 radiance;
     vec3 throughput;
     vec3 nextOrigin;
-    vec3 nextDirection;
+    vec2 nextDirEnc;
     uint rngState;
-    bool terminated;
 };
 
 
@@ -360,6 +360,25 @@ vec3 sampleSunCone(inout uint rngState, in vec3 sunDir, in float sunAngularRadiu
 
 float luminance(in vec3 c) {
     return dot(c, vec3(0.2126, 0.7152, 0.0722));
+}
+
+float G1(in float NdotX, in float k) {
+    return NdotX / (NdotX * (1.0 - k) + k);
+}
+
+
+float signNotZero(in float k) { return k >= 0.0 ? 1.0 : -1.0; }
+vec2 signNotZero(in vec2 v) { return vec2(signNotZero(v.x), signNotZero(v.y)); }
+
+vec2 octEncode(in vec3 v) {
+    vec2 p = v.xy * (1.0 / (abs(v.x) + abs(v.y) + abs(v.z)));
+    return (v.z <= 0.0) ? ((1.0 - abs(p.yx)) * signNotZero(p)) : p;
+}
+
+vec3 octDecode(in vec2 e) {
+    vec3 v = vec3(e.xy, 1.0 - abs(e.x) - abs(e.y));
+    if (v.z < 0.0) v.xy = (1.0 - abs(v.yx)) * signNotZero(v.xy);
+    return normalize(v);
 }
 
 

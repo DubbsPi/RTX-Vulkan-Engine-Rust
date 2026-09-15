@@ -25,11 +25,6 @@ layout(binding = 5, set = 0, scalar) buffer MaterialIDs {uint materialIds[];};
 layout(binding = 7, set = 0) uniform sampler2D textures[];
 
 
-float G1(in float NdotX, in float k) {
-    return NdotX / (NdotX * (1.0 - k) + k);
-}
-
-
 void main() {
     vec3 camPos = cam.viewInverse[3].xyz;
     uint modelIndex = gl_InstanceCustomIndexEXT + gl_GeometryIndexEXT;
@@ -74,8 +69,10 @@ void main() {
     Material mat = mats[materialId];
     vec3 albedo = mat.albedo;
 
+    float textureLodLevel = log2(max(gl_RayTmaxEXT, 1.0));
+
     if (mat.albedoTextureIndex >= 0) {
-        vec4 textureSample = texture(textures[nonuniformEXT(mat.albedoTextureIndex)], uv);        
+        vec4 textureSample = textureLod(textures[nonuniformEXT(mat.albedoTextureIndex)], uv, textureLodLevel);
         albedo = textureSample.rgb;
     }
 
@@ -110,6 +107,7 @@ void main() {
 
     vec3 F0 = mix(vec3(0.08 * mat.specular), albedo, mat.metallic);
 
+    
     vec3 F;
     float Fc;
     vec3 specular = cookTorrance(mat.roughness, F0, NdotV, NdotL, NdotH, VdotH, F);
@@ -124,11 +122,6 @@ void main() {
 
     vec3 base = (diffuse + specular) * (1.0 - mat.clearcoat * Fc);
     vec3 direct = (base + clearcoatLobe + sheenLobe) * NdotL * lightColor * shadowFactor;
-    
-    vec3 reflectDir = reflect(gl_WorldRayDirectionEXT, normal);
-    vec3 Fenv = F0 + (max(vec3(1.0 - mat.roughness), F0) - F0) * pow(1.0 - NdotV, 5.0);
-    vec3 reflectionColor = any(greaterThan(Fenv * mat.metallic, vec3(0.05)))? getSky(reflectDir, sunLightDir, camPos.y) : vec3(0);
-    
 
     //mat2x3 fog = marchFog(camPos, gl_WorldRayDirectionEXT, gl_RayTmaxEXT);
 
@@ -137,18 +130,63 @@ void main() {
     vec3 bounceDir;
     vec3 brdfWeight;
 
-    float specProb = mat.metallic * 0.5 + 0.5 * max(F0.r, max(F0.g, F0.b));
-    if (rand(payload.rngState) < specProb) {
+
+    float baseClearcoatProb = mat.clearcoat * Fc;
+    float baseSpecProb = (1.0 - baseClearcoatProb) * (mat.metallic * 0.5 + 0.5 * max(F0.r, max(F0.g, F0.b)));
+    float baseDiffuseProb = max(1.0 - baseClearcoatProb - baseSpecProb, 0.0);
+
+    float clearcoatProb = clamp(baseClearcoatProb, 0.01, 0.99);
+    float specProb = clamp(baseSpecProb, 0.01, 0.99);
+    float diffuseProb = clamp(baseDiffuseProb, 0.01, 0.99);
+
+    float r = rand(payload.rngState);
+    if (r < baseClearcoatProb) {
+        vec3 F0_cc = vec3(0.04);
+
+        vec3 H_cc = sampleGGX(payload.rngState, normal, mat.clearcoatRoughness);
+        bounceDir = reflect(gl_WorldRayDirectionEXT, H_cc);
+
+        float NdotL_cc = max(dot(normal, bounceDir), 0.001);
+        float NdotH_cc = max(dot(normal, H_cc), 0.0);
+        float VdotH_cc = max(dot(V, H_cc), 0.0);
+
+        vec3 F_cc = F0_cc + (1.0 - F0_cc) * pow(1.0 - VdotH_cc, 5.0);
+
+        float alpha_cc = mat.clearcoatRoughness * mat.clearcoatRoughness;
+        float k_cc = alpha_cc * 0.5;
+        float G_cc = G1(NdotV, k_cc) * G1(NdotL_cc, k_cc);
+
+        brdfWeight = mat.clearcoat * (F_cc * G_cc * VdotH_cc) / (NdotV * NdotH_cc * clearcoatProb);
+    } else if (r < baseClearcoatProb + baseSpecProb) {
         vec3 H_sample = sampleGGX(payload.rngState, normal, mat.roughness);
         bounceDir = reflect(gl_WorldRayDirectionEXT, H_sample);
-        brdfWeight = specular / specProb;
+
+        float NdotL_b = max(dot(normal, bounceDir), 0.001);
+        float NdotH_b = max(dot(normal, H_sample), 0.0);
+        float VdotH_b = max(dot(V, H_sample), 0.0);
+
+        vec3 F_indirect = F0 + (1.0 - F0) * pow(1.0 - VdotH_b, 5.0);
+
+        float alpha = mat.roughness * mat.roughness;
+        float k_ibl = alpha * 0.5;
+        float G = G1(NdotV, k_ibl) * G1(NdotL_b, k_ibl);
+
+        brdfWeight = (F_indirect * G * VdotH_b) / (NdotV * NdotH_b * specProb);
     } else {
         bounceDir = cosineHemisphere(normal, payload.rngState);
         brdfWeight = diffuseColor / (1.0 - specProb);
     }
 
+    if (any(isnan(brdfWeight)) || any(isinf(brdfWeight))) {
+        brdfWeight = vec3(0.0);
+    }
+
+    float luminance = luminance(brdfWeight);
+    if (luminance > maxWeight) {
+        brdfWeight *= (maxWeight / luminance);
+    }
+
     payload.throughput = brdfWeight;
     payload.nextOrigin = hitPos + geometricNormal * 0.001;
-    payload.nextDirection = bounceDir;
-    payload.terminated = false;
+    payload.nextDirEnc = octEncode(bounceDir);
 }

@@ -34,6 +34,7 @@ void main() {
     vec2 uv = pixelCenter / vec2(gl_LaunchSizeEXT.xy);
     vec2 ndc = uv * 2.0 - 1.0;
 
+    vec3 camPos = cam.viewInverse[3].xyz;
     vec4 origin = cam.viewInverse * vec4(0, 0, 0, 1);
     vec4 target = normalize(cam.projInverse * vec4(ndc.x, ndc.y, 1, 1));
     vec3 rayDirView = normalize(target.xyz / target.w);
@@ -44,12 +45,11 @@ void main() {
 
     vec3 rayOrigin = origin.xyz;
     vec3 rayDirection = normalize(cam.viewInverse * vec4(rayDirView, 0)).xyz;
-
+    vec3 hitPos;
 
     for (int bounce = 0; bounce < MAX_BOUNCES; bounce++) {
         payload.radiance = vec3(0);
         payload.throughput = vec3(1);
-        payload.terminated = false;
 
         traceRayEXT(
             topLevelAS,
@@ -62,8 +62,7 @@ void main() {
 
         accumulatedColor += throughput * payload.radiance;
 
-        if (payload.terminated) break; 
-
+        if (payload.nextDirEnc.x > 1.5) break;  // Encoded value out of range, therefore a mis
         throughput *= payload.throughput;
 
         if (bounce > 1) {
@@ -73,7 +72,10 @@ void main() {
         }
 
         rayOrigin = payload.nextOrigin;
-        rayDirection = payload.nextDirection;
+        rayDirection = octDecode(payload.nextDirEnc);
+
+        if (bounce == 0)
+            hitPos = rayOrigin;
     }
 
 
@@ -87,5 +89,5 @@ void main() {
     float weight = 1.0 / float(min(pc.accumulatedSamples, MAX_ACCUMULATION) + 1);
     vec3 newAccum = mix(historyColor, accumulatedColor, weight);
 
-    imageStore(accumImage, pixelCoord, vec4(newAccum, length(payload.nextOrigin)));
+    imageStore(accumImage, pixelCoord, vec4(newAccum, distance(camPos, hitPos)));
 }
