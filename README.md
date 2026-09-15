@@ -7,6 +7,7 @@ A hardware-accelerated path tracer built from scratch in **Rust** on top of **Vu
 <p align="center">
   <img src="pt.gif" alt="Path trace converging from noise to a clean image" width="720">
 </p>
+Sorry about the gif. The conversion quality really got bad here
 
 ## What it actually does
 
