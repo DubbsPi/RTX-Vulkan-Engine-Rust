@@ -19,20 +19,6 @@ const float kernel[25] = float[](
 );
 
 
-bool finiteFloat(in float v) {
-    return !isnan(v) && !isinf(v);
-}
-
-bool finiteVec3(in vec3 v) {
-    return all(not(isnan(v))) && all(not(isinf(v)));
-}
-
-vec3 sanitizeColor(in vec3 c) {
-    if (!finiteVec3(c))
-        return vec3(0.0);
-    return max(c, vec3(0.0));
-}
-
 vec4 filterPass(ivec2 pixel, ivec2 size, int stepSize) {
     vec4 centerRaw = imageLoad(accumImage, pixel);
 
@@ -137,7 +123,7 @@ void main() {
     
     float denoisedLum = luminance(denoised);
     vec3 clampedDenoised = denoised;
-
+    
     float minAllowed = minLum * 0.25;
     float maxAllowed = maxLum * 1.5;
 

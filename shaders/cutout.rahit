@@ -12,6 +12,12 @@ layout(binding = 5, set = 0, scalar) buffer MaterialIDs { uint materialIds[]; };
 layout(binding = 7, set = 0) uniform sampler2D textures[];
 
 
+layout(push_constant) uniform PushConstants {
+    uint frameIndex;
+    uint accumulatedSamples;
+} pc;
+
+
 void main() {
     uint modelIndex = gl_InstanceCustomIndexEXT + gl_GeometryIndexEXT;
     ObjectDesc obj = descs[modelIndex];
@@ -38,8 +44,9 @@ void main() {
         float textureLodLevel = log2(max(gl_RayTmaxEXT, 1.0));
         vec4 textureSample = textureLod(textures[nonuniformEXT(mat.albedoTextureIndex)], uv, textureLodLevel);
         
-        if (textureSample.a == 0.0) {
-            ignoreIntersectionEXT;
-        }
+        uint seed = randInt(gl_LaunchIDEXT.xy, gl_LaunchSizeEXT.xy, pc.frameIndex);
+
+        if (mat.alphaMode == 1 && textureSample.a < mat.alphaCutoff) ignoreIntersectionEXT;
+        else if (mat.alphaMode == 2 && textureSample.a < rand(seed)) ignoreIntersectionEXT;
     }
 }

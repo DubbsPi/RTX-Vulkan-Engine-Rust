@@ -58,6 +58,9 @@ pub struct Material {
 
     pub sheen: f32,
     pub sheen_color: Vec3,
+
+    pub alpha_mode: u32,
+    pub alpha_cutoff: f32,
 }
 
 

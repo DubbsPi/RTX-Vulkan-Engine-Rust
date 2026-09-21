@@ -49,14 +49,23 @@ pub struct ModelInfo {
     pub model_index_range: UintRange,
     pub skeleton: Option<Skeleton>,
     pub model_class: ModelClass,
+    pub geom_ranges: Vec<GeomRange>,
+    pub blas_group: Option<u32>,
+    pub instance_transform: Mat4,
+}
+
+#[derive(Clone, Copy)]
+pub struct GeomRange {
+    pub tri_start: u32,
+    pub tri_count: u32,
+    pub opaque: bool,
 }
 
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum ModelClass {
-    Static,
-    SemiDynamic,
-    Dynamic, 
+    Rigid,
+    Deformable,
 }
 
 
@@ -70,6 +79,27 @@ pub struct Model {
     animations: Vec<AnimationClip>,
 }
 
+impl Model {
+    fn partition_by_opacity(&mut self) {
+        let tri_count = self.indices.len() / 3;
+        let is_opaque = |m: &Model, t: usize| {
+            m.materials.get(m.material_ids[t] as usize).map_or(true, |mat| mat.alpha_mode == 0)
+        };
+
+        let mut order: Vec<usize> = (0..tri_count).collect();
+        order.sort_by_key(|&t| !is_opaque(self, t));
+        if order.iter().enumerate().all(|(i, &t)| i == t) { return; }
+
+        let mut new_indices = Vec::with_capacity(self.indices.len());
+        let mut new_ids = Vec::with_capacity(tri_count);
+        for &t in &order {
+            new_indices.extend_from_slice(&self.indices[t * 3..t * 3 + 3]);
+            new_ids.push(self.material_ids[t]);
+        }
+        self.indices = new_indices;
+        self.material_ids = new_ids;
+    }
+}
 
 impl From<&Model> for Model {
     fn from(item: &Model) -> Self {
@@ -87,7 +117,7 @@ pub struct Scene {
     material_map: HashMap<Material, u32>,
 
     pub model_info: Vec<ModelInfo>,
-    pub transform_matrices: Vec<Mat4>,
+    pub local_transforms: Vec<Mat4>,
 
     pub animations: Vec<AnimationPlayer>,
 
@@ -102,7 +132,7 @@ impl Scene {
             material_ids: Vec::new(), materials: Vec::new(),
             material_map: HashMap::new(),
             model_info: Vec::new(),
-            transform_matrices: Vec::new(),
+            local_transforms: Vec::new(),
             animations: Vec::new(),
             model_names: IndexSet::new(),
         }
@@ -167,12 +197,10 @@ impl Scene {
             asset
         };
 
-        // Models without a skin still need the dummy root.
         let skeleton = asset
             .skeleton
             .or_else(|| Some(dummy_root_skeleton()));
 
-        // Upload textures to Vulkan.
         let texture_offset = data.textures.len() as i32;
 
         let result = create_cached_textures(
@@ -184,8 +212,6 @@ impl Scene {
 
         data.textures.extend(result);
 
-        // Texture indices coming from glTF are local to this model.
-        // Make them point into the global AppData texture array.
         let mut materials = asset.materials;
 
         for material in &mut materials {
@@ -193,17 +219,21 @@ impl Scene {
                 material.albedo_texture_index += texture_offset;
             }
         }
-
+        
         info!("Loaded {} into memory", path);
 
-        Ok(Model {
+        let mut model = Model {
             vertices: asset.vertices,
             indices: asset.indices,
             material_ids: asset.material_ids,
             materials,
             skeleton,
             animations: asset.animations,
-        })
+        };
+
+        model.partition_by_opacity();
+
+        Ok(model)
     }}
 
     pub fn add_model_to_scene(&mut self, model: &Model, model_class: ModelClass, model_name: Option<String>) {
@@ -212,7 +242,7 @@ impl Scene {
 
         // Default matrix
         let transform_matrix = Mat4::identity();
-        self.transform_matrices.push(transform_matrix);
+        self.local_transforms.push(transform_matrix);
 
         // Add vertices/indices
         let base_vertex = self.vertices.len() as u32;
@@ -245,6 +275,17 @@ impl Scene {
                     material_mapping[model_material_id as usize]
                 })
         );
+
+        let mut geom_ranges: Vec<GeomRange> = Vec::new();
+        for t in 0..model.indices.len() / 3 {
+            let opaque = model.materials
+                .get(model.material_ids[t] as usize)
+                .map_or(true, |m| m.alpha_mode == 0);
+            match geom_ranges.last_mut() {
+                Some(r) if r.opaque == opaque => r.tri_count += 1,
+                _ => geom_ranges.push(GeomRange {tri_start: t as u32, tri_count: 1, opaque}),
+            }
+        }
         
         // Save model info
         self.model_info.push(ModelInfo {
@@ -252,6 +293,8 @@ impl Scene {
             model_index_range: UintRange {min: index_offset, max: index_offset + model.indices.len() as u32},
             skeleton: model.skeleton.clone(),
             model_class,
+            geom_ranges, blas_group: None,
+            instance_transform: Mat4::identity(),
         });
 
         match model_name {
@@ -266,50 +309,69 @@ impl Scene {
         self.model_names.get_index_of(&model_name)
     }
     
+    pub fn set_blas_group(&mut self, id: StringOrInt, group: Option<u32>) {
+        let Some(mi) = self.resolve(id) else {return};
 
-    pub fn translate_model(&mut self, model_id: StringOrInt, offset: Vec3) {
-        let model_index = match model_id {
-            StringOrInt::Str(s) => {
-                if let Some(i) = self.search_for_model_id(s) {
-                    i
-                } else {
-                    return
-                }
-            },
-            StringOrInt::Int(i) => i,
-        };
+        let world = self.model_info[mi].instance_transform * self.local_transforms[mi];
+        self.model_info[mi].blas_group = group;
 
-        self.transform_matrices[model_index] = Mat4::from_translation(offset) * self.transform_matrices[model_index];
+        let others: Vec<usize> = self.group_members(mi).into_iter().filter(|&m| m != mi).collect();
+        match others.first() {
+            Some(&anchor) => {
+                let t = self.model_info[anchor].instance_transform;
+                let inv = t.invert().unwrap_or_else(Mat4::identity);
+                self.model_info[mi].instance_transform = t;
+                self.local_transforms[mi] = inv * world;
+            }
+            None => {
+                self.model_info[mi].instance_transform = world;
+                self.local_transforms[mi] = Mat4::identity();
+            }
+        }
     }
 
-    pub fn scale_model(&mut self, model_id: StringOrInt, scale: Vec3) {
-        let model_index = match model_id {
-            StringOrInt::Str(s) => {
-                if let Some(i) = self.search_for_model_id(s) {
-                    i
-                } else {
-                    return
-                }
-            },
-            StringOrInt::Int(i) => i,
-        };
-
-        self.transform_matrices[model_index] = Mat4::from_nonuniform_scale(scale.x, scale.y, scale.z) * self.transform_matrices[model_index];
+    pub fn resolve(&self, id: StringOrInt) -> Option<usize> {
+        match id {
+            StringOrInt::Str(s) => self.search_for_model_id(s),
+            StringOrInt::Int(i) => (i < self.model_info.len()).then_some(i),
+        }
     }
 
-    pub fn set_transform(&mut self, model_id: StringOrInt, transform: Mat4) {
-        let model_index = match model_id {
-            StringOrInt::Str(s) => {
-                if let Some(i) = self.search_for_model_id(s) {
-                    i
-                } else {
-                    return
-                }
-            },
-            StringOrInt::Int(i) => i,
-        };
 
-        self.transform_matrices[model_index] = transform;
+    pub fn group_members(&self, mi: usize) -> Vec<usize> {
+        match self.model_info[mi].blas_group {
+            None => vec![mi],
+            Some(g) => {
+                let class = self.model_info[mi].model_class;
+                self.model_info.iter().enumerate()
+                    .filter(|(_, m)| m.blas_group == Some(g) && m.model_class == class)
+                    .map(|(i, _)| i)
+                    .collect()
+            }
+        }
+    }
+
+    pub fn transform_model(&mut self, id: StringOrInt, delta: Mat4) {
+        let Some(mi) = self.resolve(id) else { return };
+        for m in self.group_members(mi) {
+            let t = &mut self.model_info[m].instance_transform;
+            *t = delta * *t;
+        }
+    }
+
+    pub fn translate_model(&mut self, id: StringOrInt, offset: Vec3) {
+        self.transform_model(id, Mat4::from_translation(offset));
+    }
+
+    pub fn scale_model(&mut self, id: StringOrInt, scale: Vec3) {
+        self.transform_model(id, Mat4::from_nonuniform_scale(scale.x, scale.y, scale.z));
+    }
+
+    pub fn set_instance_transform(&mut self, id: StringOrInt, transform: Mat4) {
+        let Some(mi) = self.resolve(id) else { return };
+        for m in self.group_members(mi) {
+            self.model_info[m].instance_transform = transform;
+        }
     }
 }
 
@@ -495,6 +557,13 @@ fn convert_materials(document: &Document) -> Vec<Material> {
                     (Vec3::new(color[0], color[1], color[2]), 1.0)
                 })
                 .unwrap_or((Vec3::new(0.0, 0.0, 0.0), 0.0));
+            
+            // Alpha mode
+            let (alpha_mode, alpha_cutoff) = match m.alpha_mode() {
+                gltf::material::AlphaMode::Opaque => (0u32, 0.0f32),
+                gltf::material::AlphaMode::Mask   => (1u32, m.alpha_cutoff().unwrap_or(0.5)),
+                gltf::material::AlphaMode::Blend  => (2u32, 0.0f32),
+            };
 
             Material {
                 albedo,
@@ -509,6 +578,8 @@ fn convert_materials(document: &Document) -> Vec<Material> {
                 clearcoat_roughness,
                 sheen,
                 sheen_color,
+                alpha_mode,
+                alpha_cutoff,
             }
         })
         .collect()
@@ -800,6 +871,8 @@ impl PartialEq for Material {
             && self.albedo.z.to_bits() == other.albedo.z.to_bits()
             && self.metallic.to_bits() == other.metallic.to_bits()
             && self.roughness.to_bits() == other.roughness.to_bits()
+            && self.alpha_mode == other.alpha_mode
+            && self.alpha_cutoff.to_bits() == other.alpha_cutoff.to_bits()
     }
 }
 
@@ -813,13 +886,15 @@ impl Hash for Material {
         self.albedo.z.to_bits().hash(state);
         self.metallic.to_bits().hash(state);
         self.roughness.to_bits().hash(state);
+        self.alpha_mode.hash(state);
+        self.alpha_cutoff.to_bits().hash(state);
     }
 }
 
 
 // Model caching
 const CACHE_MAGIC: &[u8; 8] = b"JMCACHE\0";
-const CACHE_VERSION: u32 = 0;
+const CACHE_VERSION: u32 = 1;
 
 #[derive(Clone)]
 pub struct CachedTexture {
@@ -1103,6 +1178,9 @@ fn write_material(w: &mut impl Write, m: &Material) -> io::Result<()> {
     write_f32(w, m.sheen_color.y)?;
     write_f32(w, m.sheen_color.z)?;
 
+    write_u32(w, m.alpha_mode)?;
+    write_f32(w, m.alpha_cutoff)?;
+
     Ok(())
 }
 
@@ -1139,6 +1217,9 @@ fn read_material(r: &mut impl Read) -> io::Result<Material> {
             read_f32(r)?,
             read_f32(r)?,
         ),
+
+        alpha_mode: read_u32(r)?,
+        alpha_cutoff: read_f32(r)?,
     })
 }
 

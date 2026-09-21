@@ -36,17 +36,11 @@ const float hr = 8500.0;
 const float hm = 1200.0;
 
 
-// Disabled for now
-#define FOG_SAMPLES 32
-#define LIGHT_SAMPLES 4
-#define QUADRATIC_FOG
-
 const float maxFogDist = 100.0;
 
 
-const int MAX_BOUNCES = 6;
-const int MAX_ACCUMULATION = 1024;
-const float maxWeight = 5.0;
+const int MAX_BOUNCES = 4;
+const int MAX_ACCUMULATION = 2048;
 
 
 struct Vertex {
@@ -61,11 +55,11 @@ struct Vertex {
 
 
 struct RayPayload {
-    vec3 radiance;
-    vec3 throughput;
-    vec3 nextOrigin;
-    vec2 nextDirEnc;
-    uint rngState;
+    vec2 attribs;
+    uint primitiveId;
+    int modelIndex;
+    float tHit;
+    mat4x3 transform;
 };
 
 
@@ -101,6 +95,9 @@ struct Material {
 
     float sheen;
     vec3 sheenColor;
+
+    uint alphaMode;
+    float alphaCutoff;
 };
 
 
@@ -367,18 +364,18 @@ float G1(in float NdotX, in float k) {
 }
 
 
-float signNotZero(in float k) { return k >= 0.0 ? 1.0 : -1.0; }
-vec2 signNotZero(in vec2 v) { return vec2(signNotZero(v.x), signNotZero(v.y)); }
-
-vec2 octEncode(in vec3 v) {
-    vec2 p = v.xy * (1.0 / (abs(v.x) + abs(v.y) + abs(v.z)));
-    return (v.z <= 0.0) ? ((1.0 - abs(p.yx)) * signNotZero(p)) : p;
+bool finiteFloat(in float v) {
+    return !isnan(v) && !isinf(v);
 }
 
-vec3 octDecode(in vec2 e) {
-    vec3 v = vec3(e.xy, 1.0 - abs(e.x) - abs(e.y));
-    if (v.z < 0.0) v.xy = (1.0 - abs(v.yx)) * signNotZero(v.xy);
-    return normalize(v);
+bool finiteVec3(in vec3 v) {
+    return all(not(isnan(v))) && all(not(isinf(v)));
+}
+
+vec3 sanitizeColor(in vec3 c) {
+    if (!finiteVec3(c))
+        return vec3(0.0);
+    return max(c, vec3(0.0));
 }
 
 
