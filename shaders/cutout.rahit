@@ -1,0 +1,44 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+
+#include "common.glsl"
+
+
+hitAttributeEXT vec2 attribs;
+
+layout(binding = 3, set = 0, scalar) buffer ObjectDescs { ObjectDesc descs[]; };
+layout(binding = 4, set = 0, scalar) buffer Materials { Material mats[]; };
+layout(binding = 5, set = 0, scalar) buffer MaterialIDs { uint materialIds[]; };
+layout(binding = 7, set = 0) uniform sampler2D textures[];
+
+
+void main() {
+    uint modelIndex = gl_InstanceCustomIndexEXT + gl_GeometryIndexEXT;
+    ObjectDesc obj = descs[modelIndex];
+
+    uint materialId = materialIds[obj.materialId + gl_PrimitiveID];
+    Material mat = mats[materialId];
+
+    // Early exit if possible
+    if (mat.albedoTextureIndex < 0) return;
+
+
+    Indices indices = Indices(obj.indexAddress);
+    Vertices vertices = Vertices(obj.vertexAddress);
+
+    uint i0 = indices.i[3 * gl_PrimitiveID];
+    uint i1 = indices.i[3 * gl_PrimitiveID + 1];
+    uint i2 = indices.i[3 * gl_PrimitiveID + 2];
+
+    vec3 bary = vec3(1.0 - attribs.x - attribs.y, attribs.x, attribs.y);
+
+    vec2 uv0 = vertices.vert[i0].uv;
+    vec2 uv1 = vertices.vert[i1].uv;
+    vec2 uv2 = vertices.vert[i2].uv;
+    vec2 uv = uv0 * bary.x + uv1 * bary.y + uv2 * bary.z;
+    
+    float textureLodLevel = log2(max(gl_RayTmaxEXT, 1.0));
+    vec4 textureSample = textureLod(textures[nonuniformEXT(mat.albedoTextureIndex)], uv, textureLodLevel);
+        
+    if (textureSample.a <= mat.alphaCutoff) ignoreIntersectionEXT;
+}
