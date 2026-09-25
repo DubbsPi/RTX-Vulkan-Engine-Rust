@@ -27,8 +27,6 @@ const float sunAngularRadius = 0.01;
 #define SKY_LIGHT_SAMPLES 8
 
 const float sunIntensity  = 15.0;
-const float earthRadius  = 6371000.0;
-const float atmosphereRadius = earthRadius + 1000000.0;
 const vec3  betaRayleigh = vec3(5.8e-6, 13.5e-6, 33.1e-6);
 const float betaMie = 21e-6;
 const float mieG = 0.76;
@@ -39,7 +37,7 @@ const float hm = 1200.0;
 const float maxFogDist = 100.0;
 
 
-const int MAX_BOUNCES = 4;
+const int MAX_BOUNCES = 6;
 const int MAX_ACCUMULATION = 2048;
 
 
@@ -98,6 +96,13 @@ struct Material {
 
     uint alphaMode;
     float alphaCutoff;
+};
+
+struct PlanetRenderInfo {
+    vec3 planetUp;
+    float cameraDist;
+    float radius;
+    float atmosphereRadius;
 };
 
 
@@ -207,6 +212,38 @@ vec2 intersectSphere(in vec3 ro, in vec3 rd, in vec3 pos, in float r) {
 
 
 // Atmospheric scattering
+struct SphereRayParams {
+    float b;
+    float c;
+};
+
+SphereRayParams sphereRayParams(vec3 dir, float distFromCenter, vec3 up0, float testRadius) {
+    SphereRayParams p;
+    p.b = distFromCenter * dot(dir, up0);
+    float hRel = distFromCenter - testRadius;
+    p.c = hRel * (distFromCenter + testRadius);
+    return p;
+}
+
+vec2 solveSphereHits(in SphereRayParams p) {
+    float disc = p.b * p.b - p.c;
+    if (disc < 0.0) return vec2(-1.0);
+    
+    float sqrtD = sqrt(disc);
+    float q = (p.b >= 0.0) ? -(p.b + sqrtD) : -(p.b - sqrtD);
+    if (abs(q) < 1e-8) return vec2(-p.b, -p.b);
+
+    float t0 = q;
+    float t1 = p.c / q;
+
+    return vec2(min(t0, t1), max(t0, t1));
+}
+
+float heightAtT(in SphereRayParams p, in float t, in float R) {
+    float f = p.c + 2.0 * p.b * t + t * t;
+    return f / (R + sqrt(max(R * R + f, 0.0)));
+}
+
 vec2 intersectSphereSky(in vec3 rayOrigin, in vec3 rayDir, in float radius) {
     float b = dot(rayOrigin, rayDir);
     float ocLen = length(rayOrigin);
@@ -226,54 +263,56 @@ float phaseMie(in float mu) {
     return 0.11936620731 * ((1.0 - g2) * (1.0 + mu * mu)) / ((2.0 + g2) * pow(abs(1.0 + g2 - 2.0 * g * mu), 1.5));
 }
 
-float opticalDepth(in vec3 pos, in vec3 dir, in float rayLength, in float scaleHeight, in int steps) {
+float opticalDepth(in SphereRayParams p, in float t0, in float rayLength, in float scaleHeight, in float R, in int steps) {
     float stepSize = rayLength / float(steps);
     float depth = 0.0;
     for (int i = 0; i < steps; i++) {
-        vec3 p = pos + dir * (float(i) + 0.5) * stepSize;
-        float h = length(p) - earthRadius;
+        float t = t0 + (float(i) + 0.5) * stepSize;
+        float h = heightAtT(p, t, R);
         depth += exp(-h / scaleHeight) * stepSize;
     }
     return depth;
 }
 
-vec3 scatterAtmosphere(in vec3 viewDir, in vec3 sunDir, in vec3 camPos, in float jitter, in vec2 atmoHit, in vec2 groundHit) {
-    vec3 origin = camPos;
-
+vec3 scatterAtmosphere(in vec3 viewDir, in vec3 sunDir, in SphereRayParams groundParams, in float distFromCenter, in vec3 up0, in float radius, in float atmoRadius, in float jitter, in vec2 atmoHit, in vec2 groundHit) {
     float tMin = max(atmoHit.x, 0.0);
     float tMax = atmoHit.y;
-
-    if (groundHit.x > 0.0)
-        tMax = min(tMax, groundHit.x);
+    if (groundHit.x > 0.0) tMax = min(tMax, groundHit.x);
 
     float stepSize = (tMax - tMin) / float(SKY_VIEW_SAMPLES);
     float tStart = tMin + jitter * stepSize;
 
-    vec3 sunRayleighAccum  = vec3(0);
+    vec3 sunRayleighAccum = vec3(0);
     vec3 sunMieAccum = vec3(0);
     float odR = 0.0;
     float odM = 0.0;
-
     float mu = dot(viewDir, sunDir);
 
     for (int i = 0; i < SKY_VIEW_SAMPLES; i++) {
-        vec3 p = origin + viewDir * (tStart + (float(i) + 0.5) * stepSize);
-        float h = length(p) - earthRadius;
+        float t = tStart + (float(i) + 0.5) * stepSize;
+        float h = heightAtT(groundParams, t, radius);
 
         float densR = exp(-h / hr) * stepSize;
         float densM = exp(-h / hm) * stepSize;
         odR += densR;
         odM += densM;
 
-        vec2 planetShadow = intersectSphereSky(p + sunDir * 0.01, sunDir, earthRadius);
+        float distFromCenterAtSample = radius + h;
+        vec3 localPos = up0 * distFromCenter + viewDir * t;
+        vec3 localUp = localPos / distFromCenterAtSample;
+
+        SphereRayParams sunGroundParams = sphereRayParams(sunDir, distFromCenterAtSample, localUp, radius);
+        SphereRayParams sunAtmoParams   = sphereRayParams(sunDir, distFromCenterAtSample, localUp, atmoRadius);
+
+        vec2 planetShadow = solveSphereHits(sunGroundParams);
         bool inShadow = planetShadow.x > 0.01;
 
         if (!inShadow) {
-            vec2 sunHit = intersectSphereSky(p, sunDir, atmosphereRadius);
+            vec2 sunHit = solveSphereHits(sunAtmoParams);
             float sunRayLen = sunHit.y;
 
-            float sunOdR = opticalDepth(p, sunDir, sunRayLen, hr, SKY_LIGHT_SAMPLES);
-            float sunOdM = opticalDepth(p, sunDir, sunRayLen, hm, SKY_LIGHT_SAMPLES);
+            float sunOdR = opticalDepth(sunGroundParams, 0.0, sunRayLen, hr, radius, SKY_LIGHT_SAMPLES);
+            float sunOdM = opticalDepth(sunGroundParams, 0.0, sunRayLen, hm, radius, SKY_LIGHT_SAMPLES);
 
             vec3 sunTransmittance = exp(-(betaRayleigh * (odR + sunOdR)) - (betaMie * (odM + sunOdM) * 1.1));
 
@@ -282,12 +321,11 @@ vec3 scatterAtmosphere(in vec3 viewDir, in vec3 sunDir, in vec3 camPos, in float
         }
     }
 
-    vec3 skyColor = sunIntensity * (phaseRayleigh(mu) * betaRayleigh * sunRayleighAccum + phaseMie(mu) * betaMie * sunMieAccum);
-    return skyColor;
+    return sunIntensity * (phaseRayleigh(mu) * betaRayleigh * sunRayleighAccum + phaseMie(mu) * betaMie * sunMieAccum);
 }
 
 vec3 starField(in vec3 rayDir) {
-    vec3 cell = floor(rayDir * 800.0);
+    vec3 cell = floor(rayDir * 750.0);
     float h = hash3(cell);
 
     float threshold = 0.998;
@@ -297,18 +335,23 @@ vec3 starField(in vec3 rayDir) {
     brightness = pow(brightness, 4.0);
 
     float colorSeed = hash3(cell + vec3(17.0, 43.0, 91.0));
-    vec3 starColor = mix(vec3(0.8, 0.85, 1.0), vec3(1.0, 0.9, 0.75), colorSeed);
+    vec3 starColor = mix(vec3(0.8, 0.85, 1.0), vec3(1.0, 0.9, 0.75), colorSeed) * 0.1;
 
     return starColor * brightness * 2.0;
 }
 
-vec3 getSky(in vec3 rayDir, in vec3 sunDir, in vec3 camPos, in float jitter) {
-    vec2 atmoHit = intersectSphereSky(camPos, rayDir, atmosphereRadius);
-    vec2 groundHit = intersectSphereSky(camPos, rayDir, earthRadius);
+vec3 getSky(in vec3 rayDir, in vec3 sunDir, in float h0, in vec3 up0, in float radius, in float atmosphereRadius, in float jitter) {    
+    float distFromCenter = radius + h0;
+
+    SphereRayParams groundParams = sphereRayParams(rayDir, distFromCenter, up0, radius);
+    SphereRayParams atmoParams   = sphereRayParams(rayDir, distFromCenter, up0, radius + atmosphereRadius);
+
+    vec2 atmoHit = solveSphereHits(atmoParams);
+    vec2 groundHit = solveSphereHits(groundParams);
 
     vec3 skyColor = vec3(0);
-    if (atmoHit.x != -1.0 && atmoHit.y != 1.0) {
-        skyColor = scatterAtmosphere(rayDir, sunDir, camPos, jitter, atmoHit, groundHit);
+    if (atmoHit.y > 0.0) {
+        skyColor = scatterAtmosphere(rayDir, sunDir, groundParams, distFromCenter, up0, radius, radius + atmosphereRadius, jitter, atmoHit, groundHit);
     }
 
     if (groundHit.x < 0.0) {
@@ -316,14 +359,15 @@ vec3 getSky(in vec3 rayDir, in vec3 sunDir, in vec3 camPos, in float jitter) {
         mappedColor = pow(clamp(mappedColor, 0.0, 1.0), vec3(0.454545455));
 
         float skyBrightness = luminance(mappedColor);
-        float starVisibility = clamp(1.0 - skyBrightness * 500.0, 0.0, 1.0);
+        float starVisibility = clamp(1.0 - skyBrightness * 4.0, 0.0, 1.0);
         
         skyColor += starField(rayDir) * starVisibility;
-    }
 
-    const float cosAngularRadius = cos(sunAngularRadius);
-    float sunDisc = smoothstep(cosAngularRadius - 0.0001, cosAngularRadius, dot(rayDir, sunDir));
-    skyColor += sunIntensity * sunDisc * smoothstep(0.0, 1.0, sunDir.y);
+        // Temporary until proper setup is added
+        const float cosAngularRadius = cos(sunAngularRadius);
+        float sunDisc = smoothstep(cosAngularRadius - 0.0001, cosAngularRadius, dot(rayDir, sunDir));
+        skyColor += sunIntensity * sunDisc * smoothstep(0.0, 1.0, sunDir.y);
+    }
 
     return skyColor;
 }

@@ -60,6 +60,7 @@ const DEVICE_EXTENSIONS: &[vk::ExtensionName] = &[
 const MAX_FRAMES_IN_FLIGHT: usize = 3;  // Don't touch me!!
 
 const MAX_TEXTURES: u32 = 4096;  // Almost free to increase, but to make dynamic is extreamly hard
+const MAX_PLANETS: u32 = 8;
 
 const REBUILD_INTERVAL: u32 = 240;
 
@@ -113,18 +114,26 @@ unsafe fn create_scene(instance: &Instance, device: &Device, data: &mut AppData)
     
         scene.add_model_to_scene(&cubes, ModelClass::Rigid, Some("Cubes".to_owned()));
         scene.translate_model(StringOrInt::Str("Cubes".to_owned()), vec3(0.0, 6371000.0 + 10.0, -4.0));
+        
+
+        data.game_data.planets.push(Planet {
+            position: Vec3d::new(0.0, 0.0, 0.0),
+            radius: 6371000.0,
+            atmosphere_radius: 100000.0
+        });
     }
 
     Ok(scene)
 }
 
-fn render_tick(app: &mut App) {
+fn render_tick(app: &mut App, _dt: f32) {
     let mag = app.camera.position.magnitude();
     
     let planet_radius = 6371000.0;
-    if mag <= planet_radius + 2.0 {
+    let epsilon = 1.00001;
+    if mag <= planet_radius * epsilon {
         let normalized = app.camera.position / mag;
-        app.camera.position = (planet_radius + 2.0) * normalized;
+        app.camera.position = (planet_radius * epsilon) * normalized;
     }
 }
 
@@ -464,8 +473,10 @@ impl App {
         create_tlas(&instance, &device, &mut data, &scene, &camera)?;
         data.frames_since_rebuild = 0;
         let object_descs = build_object_descs(&device, &data, &scene);
+        
         create_scene_buffers(&instance, &device, &mut data, &scene.materials, &scene.material_ids, &object_descs)?;
-                
+        create_planets_buffers(&instance, &device, &mut data)?;
+
         create_uniform_buffers(&instance, &device, &mut data)?;
         create_descriptor_pool(&device, &mut data)?;
         create_descriptor_sets(&device, &mut data)?;
@@ -607,6 +618,14 @@ impl App {
 
         self.device.destroy_descriptor_pool(self.data.descriptor_pool, None);
 
+        for buffer in self.data.planets_buffers.drain(..) {
+            self.device.destroy_buffer(buffer, None);
+        }
+        for memory in self.data.planets_buffers_memory.drain(..) {
+            self.device.unmap_memory(memory);
+            self.device.free_memory(memory, None);
+        }
+
         for buffer in self.data.uniform_buffers.drain(..) {
             self.device.destroy_buffer(buffer, None);
         }
@@ -694,7 +713,6 @@ impl App {
         self.last_frame = now;
 
 
-        self.update_camera(dt);
         self.update_uniform_buffer(image_index)?;
 
         // Rerecord command buffer
@@ -1011,6 +1029,7 @@ impl App {
 
         create_shader_binding_table(&self.instance, &self.device, &mut self.data)?;
         
+        create_planets_buffers(&self.instance, &self.device, &mut self.data)?;
         create_uniform_buffers(&self.instance, &self.device, &mut self.data)?;
         create_descriptor_pool(&self.device, &mut self.data)?;
         create_descriptor_sets(&self.device, &mut self.data)?;
@@ -1027,17 +1046,46 @@ impl App {
     }}
 
 
-    unsafe fn update_uniform_buffer(&self, image_index: usize) -> Result<()> { unsafe {
+    unsafe fn update_uniform_buffer(&mut self, image_index: usize) -> Result<()> { unsafe {
         let time = self.start.elapsed().as_secs_f32();
         let view = self.camera.view_matrix();
         let mut proj = cgmath::perspective(Deg(45.0), self.data.swapchain_extent.width as f32 / self.data.swapchain_extent.height as f32, 0.1, 100.0);
         proj[1][1] *= -1.0;
 
+        // Compute planet info
+        let mut planet_render_info: Vec<PlanetRenderInfo> = Vec::with_capacity(self.data.game_data.planets.len());
+        for planet in &self.data.game_data.planets {
+            let to_camera = self.camera.position - planet.position;
+            let to_camera_length = to_camera.magnitude();
+
+            if to_camera_length <= 0.0 {
+                continue;
+            }
+
+            let camera_dist = to_camera_length - planet.radius;
+            let planet_up = to_camera / to_camera_length;
+
+            let camera_dist_f32 = camera_dist as f32;
+            let planet_up_f32 = Vec3::new(planet_up.x as f32, planet_up.y as f32, planet_up.z as f32);
+
+            if camera_dist_f32.is_finite() {
+                planet_render_info.push(PlanetRenderInfo {planet_up: planet_up_f32, camera_dist: camera_dist_f32, radius: planet.radius as f32, atmosphere_radius: planet.atmosphere_radius as f32});
+            }
+        }
+
+        let count = planet_render_info.len().min(self.data.planets_capacity as usize);
+        memcpy(
+            planet_render_info.as_ptr().cast::<u8>(),
+            self.data.planets_buffers_mapped[image_index],
+            size_of::<PlanetRenderInfo>() * count,
+        );
+
         let ubo = CameraUniformBufferObject {
             view_inverse: view.invert().ok_or_else(|| anyhow!("Failed to invert view matrix"))?,
             proj_inverse: proj.invert().ok_or_else(|| anyhow!("Failed to invert proj matrix"))?,
             time,
-            camera_pos: Vec3::new(self.camera.position.x as f32, self.camera.position.y as f32, self.camera.position.z as f32)
+            camera_pos: Vec3::new(self.camera.position.x as f32, self.camera.position.y as f32, self.camera.position.z as f32),
+            num_planets: count as u32,
         };
 
         memcpy(
@@ -1194,6 +1242,7 @@ impl App {
         }
     }}
     
+    #[expect(unused)]
     unsafe fn regroup_model(&mut self, id: StringOrInt, group: Option<u32>) -> Result<()> { unsafe {
         self.device.device_wait_idle()?;
         self.scene.set_blas_group(id, group);
@@ -1561,11 +1610,20 @@ impl App {
                 .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                 .buffer_info(std::slice::from_ref(&material_ids_info)).build());
 
-            
+            let planets_info = vk::DescriptorBufferInfo::builder()
+                .buffer(self.data.planets_buffers[i])
+                .offset(0)
+                .range(vk::WHOLE_SIZE)
+                .build();
+            writes.push(vk::WriteDescriptorSet::builder()
+                .dst_set(self.data.descriptor_sets[i]).dst_binding(7).dst_array_element(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(std::slice::from_ref(&planets_info)).build());
+
             if !texture_infos.is_empty() {
                 writes.push(vk::WriteDescriptorSet::builder()
                     .dst_set(self.data.descriptor_sets[i])
-                    .dst_binding(7)
+                    .dst_binding(8)
                     .dst_array_element(0)
                     .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                     .image_info(&texture_infos)
@@ -1775,6 +1833,48 @@ struct AppData {
     timestamp_query_pool: vk::QueryPool,
     timestamp_period: f32,
     queries_valid: [bool; MAX_FRAMES_IN_FLIGHT],
+
+    // Planets
+    planets_buffers: Vec<vk::Buffer>,
+    planets_buffers_memory: Vec<vk::DeviceMemory>,
+    planets_buffers_mapped: Vec<*mut u8>,
+    planets_capacity: u32,
+
+    // Misc structs
+    game_data: GameData,
+    render_info: RenderInfo,
+}
+
+
+#[derive(Default)]
+struct GameData {
+    planets: Vec<Planet>,
+}
+
+
+#[repr(C)]
+#[derive(Default)]
+struct RenderInfo {
+    planet_render_info: Vec<PlanetRenderInfo>,
+}
+
+
+#[derive(smart_default::SmartDefault)]
+struct Planet {
+    #[default(Vec3d::new(0.0, 0.0, 0.0))]
+    position: Vec3d,
+    radius: f64,
+    atmosphere_radius: f64,
+}
+
+#[repr(C)]
+#[derive(smart_default::SmartDefault, Copy, Clone, Debug)]
+struct PlanetRenderInfo {
+    #[default(Vec3::new(0.0, 0.0, 0.0))]
+    planet_up: Vec3,
+    camera_dist: f32,
+    radius: f32,
+    atmosphere_radius: f32,
 }
 
 
@@ -1883,6 +1983,7 @@ struct CameraUniformBufferObject {
     proj_inverse: Mat4,
     time: f32,
     camera_pos: Vec3,
+    num_planets: u32,
 }
 
 
@@ -3053,6 +3154,29 @@ unsafe fn create_uniform_buffers(instance: &Instance, device: &Device, data: &mu
     Ok(())
 }}
 
+unsafe fn create_planets_buffers(instance: &Instance, device: &Device, data: &mut AppData) -> Result<()> { unsafe {
+    data.planets_buffers.clear();
+    data.planets_buffers_memory.clear();
+    data.planets_buffers_mapped.clear();
+
+    let size = (size_of::<PlanetRenderInfo>() as u64) * MAX_PLANETS as u64;
+
+    for _ in 0..data.swapchain_images.len() {
+        let (buf, mem) = create_buffer(
+            instance, device, data, size,
+            vk::BufferUsageFlags::STORAGE_BUFFER,
+            vk::MemoryPropertyFlags::HOST_COHERENT | vk::MemoryPropertyFlags::HOST_VISIBLE,
+        )?;
+        let mapped = device.map_memory(mem, 0, size, vk::MemoryMapFlags::empty())? as *mut u8;
+
+        data.planets_buffers.push(buf);
+        data.planets_buffers_memory.push(mem);
+        data.planets_buffers_mapped.push(mapped);
+    }
+    data.planets_capacity = MAX_PLANETS;
+    Ok(())
+}}
+
 
 // Acceleration buffer utils
 unsafe fn destroy_blas(device: &Device, blas: &Blas) { unsafe {
@@ -3837,9 +3961,15 @@ unsafe fn create_descriptor_set_layout(
         .descriptor_count(1)
         .stage_flags(rt_stages);
 
+    let planets_binding = vk::DescriptorSetLayoutBinding::builder()
+        .binding(7)
+        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+        .descriptor_count(1)
+        .stage_flags(rt_stages);
+
     // MUST ALWAYS BE HIGHEST
     let textures_binding = vk::DescriptorSetLayoutBinding::builder()
-        .binding(7)
+        .binding(8)
         .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
         .descriptor_count(MAX_TEXTURES)
         .stage_flags(rt_stages);
@@ -3850,10 +3980,12 @@ unsafe fn create_descriptor_set_layout(
         ubo_binding, 
         object_descs_binding, materials_binding, material_ids_binding,
         accum_image_binding,
+        planets_binding,
         textures_binding,
     ];
 
     let binding_flags = &[
+        vk::DescriptorBindingFlags::empty(),
         vk::DescriptorBindingFlags::empty(),
         vk::DescriptorBindingFlags::empty(),
         vk::DescriptorBindingFlags::empty(),
@@ -4068,11 +4200,25 @@ unsafe fn create_descriptor_sets(device: &Device, data: &mut AppData) -> Result<
         writes.push(accum_image_write);
 
 
+        // Planet write
+        let planets_info = vk::DescriptorBufferInfo::builder()
+            .buffer(data.planets_buffers[i])
+            .offset(0)
+            .range(vk::WHOLE_SIZE)
+            .build();
+        writes.push(vk::WriteDescriptorSet::builder()
+            .dst_set(data.descriptor_sets[i])
+            .dst_binding(7)
+            .dst_array_element(0)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(std::slice::from_ref(&planets_info)).build());
+
+
         // Texture write
         if !texture_infos.is_empty() {
             let textures_write = vk::WriteDescriptorSet::builder()
                 .dst_set(data.descriptor_sets[i])
-                .dst_binding(7)
+                .dst_binding(8)
                 .dst_array_element(0)
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                 .image_info(&texture_infos)
@@ -4152,7 +4298,10 @@ fn main() -> Result<()> {
             } => {
                 unsafe {
                     if !elwt.exiting() && !minimized {
-                        render_tick(&mut app);
+                        let dt = (Instant::now() - app.last_frame).as_secs_f32();
+
+                        app.update_camera(dt);
+                        render_tick(&mut app, dt);
 
                         if let Err(e) = app.render(&window) {
                             error!("Render failed: {:?}", e);
