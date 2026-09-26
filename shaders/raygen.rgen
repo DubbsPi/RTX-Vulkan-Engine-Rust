@@ -9,7 +9,9 @@ layout(binding = 2, set = 0, scalar) uniform CameraUBO {
     mat4 projInverse;
     float time;
     vec3 cameraPos;
+
     uint numPlanets;
+    uint numStars;
 } cam;
 
 layout(binding = 0, set = 0) uniform accelerationStructureEXT topLevelAS;
@@ -18,7 +20,8 @@ layout(binding = 4, set = 0, scalar) buffer Materials {Material mats[];};
 layout(binding = 5, set = 0, scalar) buffer MaterialIDs {uint materialIds[];};
 layout(binding = 6, set = 0, rgba32f) uniform image2D accumImage;
 layout(binding = 7, set = 0, scalar) buffer Planets {PlanetRenderInfo planets[];} planetBuffer;
-layout(binding = 8, set = 0) uniform sampler2D textures[];
+layout(binding = 8, set = 0, scalar) buffer Stars {StarRenderInfo stars[];} starBuffer;
+layout(binding = 9, set = 0) uniform sampler2D textures[];
 
 
 layout(push_constant) uniform PushConstants {
@@ -68,8 +71,32 @@ void main() {
             vec3 sky = vec3(0);
             for (uint i = 0; i < cam.numPlanets; i++) {
                 PlanetRenderInfo pinfo = planetBuffer.planets[i];
-                sky += getSky(rayDirection, sunLightDir, pinfo, rand(rngState));
+
+                vec3 planetPos = pinfo.planetUp * (pinfo.radius + pinfo.cameraDist);
+                vec3 lightDir = vec3(0);
+                vec3 irradiance = vec3(0);
+
+                if (pinfo.parentStar >= 0) {
+                    StarRenderInfo sinfo = starBuffer.stars[pinfo.parentStar];
+                    starLightAtPoint(sinfo, planetPos, lightDir, irradiance);
+                }
+
+                float lightMag = max(irradiance.r, max(irradiance.g, irradiance.b));
+                vec3 lightColorNorm = lightMag > 1e-6 ? irradiance / lightMag : vec3(0);
+
+                sky += getPlanetSky(rayDirection, lightDir, lightColorNorm, lightMag, pinfo, rand(rngState));
             }
+            
+            // Stars
+            for (uint i = 0; i < cam.numStars; i++) {
+                StarRenderInfo sinfo = starBuffer.stars[i];
+                vec3 starPos = starPositionCamRelative(sinfo);
+                vec2 hit = intersectSphere(rayOrigin, rayDirection, starPos, sinfo.radius);
+                if (hit.x > 0.0 || hit.y > 0.0) {
+                    sky += sinfo.color * min(sinfo.luminosity, 1e18);
+                }
+            }
+
             accumulatedColor += throughput * sky;
             break;
         }
@@ -79,6 +106,18 @@ void main() {
             for (uint i = 0; i < cam.numPlanets; i++) {
                 PlanetRenderInfo pinfo = planetBuffer.planets[i];
                 float distFromCenter = pinfo.radius + pinfo.cameraDist;
+
+                if (pinfo.parentStar < 0) continue;
+
+                vec3 planetPos = pinfo.planetUp * distFromCenter;
+                StarRenderInfo sinfo = starBuffer.stars[pinfo.parentStar];
+                vec3 lightDir, irradiance;
+                starLightAtPoint(sinfo, planetPos, lightDir, irradiance);
+
+                float lightMag = max(irradiance.r, max(irradiance.g, irradiance.b));
+                if (lightMag < 1e-6) continue;
+                vec3 lightColorNorm = irradiance / lightMag;
+
                 SphereRayParams groundParams = sphereRayParams(rayDirection, distFromCenter, pinfo.planetUp, pinfo.radius);
                 SphereRayParams atmoParams = sphereRayParams(rayDirection, distFromCenter, pinfo.planetUp, pinfo.radius + pinfo.atmosphereRadius);
 
@@ -89,7 +128,7 @@ void main() {
 
                 if (segEnd > segStart) {
                     vec3 trans;
-                    vec3 insc = scatterAtmosphere(rayDirection, sunLightDir, groundParams, distFromCenter, pinfo, rand(rngState), segStart, segEnd, trans);
+                    vec3 insc = scatterAtmosphere(rayDirection, lightDir, lightColorNorm, lightMag, groundParams, distFromCenter, pinfo, rand(rngState), segStart, segEnd, trans);
                     primaryInscatter = primaryInscatter * trans + insc;
                     primaryTransmittance *= trans;
                 }

@@ -42,6 +42,12 @@ use scene::Scene;
 use scene::Model;
 use scene::ModelClass;
 
+mod game;
+use game::Planet;
+use game::PlanetRenderInfo;
+use game::Star;
+use game::StarRenderInfo;
+
 
 const PORTABILITY_MACOS_VERSION: Version = Version::new(1, 3, 216);
 
@@ -61,84 +67,11 @@ const MAX_FRAMES_IN_FLIGHT: usize = 3;  // Don't touch me!!
 
 const MAX_TEXTURES: u32 = 4096;  // Almost free to increase, but to make dynamic is extreamly hard
 const MAX_PLANETS: u32 = 8;
+const MAX_STARS: u32 = 4;
 
 const REBUILD_INTERVAL: u32 = 240;
 
 const ENABLE_CUTOUT_SHADER: bool = true;
-
-
-unsafe fn create_scene(instance: &Instance, device: &Device, data: &mut AppData) -> Result<Scene> {
-    let mut scene = Scene::new();
-    
-    unsafe {
-        let magazine = Scene::load_model_into_memory(
-            &mut scene,
-            "models/Magazine.glb",
-            &instance, &device, data,
-        )?;
-        let protogen = Scene::load_model_into_memory(
-            &mut scene,
-            "models/Xenon.glb",
-            &instance, &device, data,
-        )?;
-        let room = Scene::load_model_into_memory(
-            &mut scene,
-            "models/Test_Room.glb",
-            &instance, &device, data,
-        )?;
-        let cubes = Scene::load_model_into_memory(
-            &mut scene,
-            "models/Test_Cubes.glb",
-            &instance, &device, data,
-        )?;
-
-
-        scene.add_model_to_scene(&magazine, ModelClass::Rigid, None);
-        scene.add_model_to_scene(&magazine, ModelClass::Rigid, None);
-
-        scene.scale_model(StringOrInt::Int(1), vec3(5.0, 5.0, 5.0));
-        scene.translate_model(StringOrInt::Int(1), vec3(1.0, 6371000.0 * 1.00001 + 10.5, 0.0));
-
-        scene.scale_model(StringOrInt::Int(0), vec3(20.0, 5.0, 10.0));
-        let rotation = Mat4::from_angle_z(Deg(90.0));
-        scene.transform_model(StringOrInt::Int(0), rotation);
-        scene.translate_model(StringOrInt::Int(0), vec3(0.0, 6371000.0 * 1.00001 + 8.0, 0.0));
-
-        // Merge magazines
-        scene.set_blas_group(StringOrInt::Int(0), Some(0));
-        scene.set_blas_group(StringOrInt::Int(1), Some(0));
-
-        scene.add_model_to_scene(&protogen, ModelClass::Deformable, Some("Xenon".to_owned()));
-        scene.translate_model(StringOrInt::Str("Xenon".to_owned()), vec3(-4.0, 6371000.0 * 1.00001 + 10.0, 0.0));
-
-        scene.add_model_to_scene(&room, ModelClass::Rigid, Some("Room".to_owned()));
-        scene.translate_model(StringOrInt::Str("Room".to_owned()), vec3(0.0, 6371000.0 * 1.00001 + 5.0, 8.0));
-    
-        scene.add_model_to_scene(&cubes, ModelClass::Rigid, Some("Cubes".to_owned()));
-        scene.translate_model(StringOrInt::Str("Cubes".to_owned()), vec3(0.0, 6371000.0 * 1.00001 + 10.0, -4.0));
-        
-
-        data.game_data.planets.push(Planet {
-            position: Vec3d::new(0.0, 0.0, 0.0),
-            radius: 6371000.0,
-            atmosphere_radius: 100000.0,
-            ..Default::default()
-        });
-    }
-
-    Ok(scene)
-}
-
-fn render_tick(app: &mut App, _dt: f32) {
-    let mag = app.camera.position.magnitude();
-    
-    let planet_radius = 6371000.0;
-    let epsilon = 1.00001;
-    if mag <= planet_radius * epsilon {
-        let normalized = app.camera.position / mag;
-        app.camera.position = (planet_radius * epsilon) * normalized;
-    }
-}
 
 
 #[derive(Copy, Clone, Debug)]
@@ -265,7 +198,7 @@ impl App {
 
         // Scene setup
         let camera = Camera::new(Vec3d::new(0.0, 6371000.0 + 10.0, 0.0));
-        let scene = create_scene(&instance, &device, &mut data)?;
+        let scene = game::create_scene(&instance, &device, &mut data)?;
 
         data.material_refcounts = vec![0u32; scene.materials.len()];
         for &mat_id in &scene.material_ids {
@@ -479,6 +412,7 @@ impl App {
         
         create_scene_buffers(&instance, &device, &mut data, &scene.materials, &scene.material_ids, &object_descs)?;
         create_planets_buffers(&instance, &device, &mut data)?;
+        create_stars_buffers(&instance, &device, &mut data)?;
 
         create_uniform_buffers(&instance, &device, &mut data)?;
         create_descriptor_pool(&device, &mut data)?;
@@ -625,6 +559,14 @@ impl App {
             self.device.destroy_buffer(buffer, None);
         }
         for memory in self.data.planets_buffers_memory.drain(..) {
+            self.device.unmap_memory(memory);
+            self.device.free_memory(memory, None);
+        }
+
+        for buffer in self.data.stars_buffers.drain(..) {
+            self.device.destroy_buffer(buffer, None);
+        }
+        for memory in self.data.stars_buffers_memory.drain(..) {
             self.device.unmap_memory(memory);
             self.device.free_memory(memory, None);
         }
@@ -1033,6 +975,7 @@ impl App {
         create_shader_binding_table(&self.instance, &self.device, &mut self.data)?;
         
         create_planets_buffers(&self.instance, &self.device, &mut self.data)?;
+        create_stars_buffers(&self.instance, &self.device, &mut self.data)?;
         create_uniform_buffers(&self.instance, &self.device, &mut self.data)?;
         create_descriptor_pool(&self.device, &mut self.data)?;
         create_descriptor_sets(&self.device, &mut self.data)?;
@@ -1056,7 +999,7 @@ impl App {
         proj[1][1] *= -1.0;
 
         // Compute planet info
-        let mut planet_render_info: Vec<PlanetRenderInfo> = Vec::with_capacity(self.data.game_data.planets.len());
+        let mut planet_render_info = Vec::with_capacity(self.data.game_data.planets.len());
         for planet in &self.data.game_data.planets {
             let to_camera = self.camera.position - planet.position;
             let to_camera_length = to_camera.magnitude();
@@ -1075,25 +1018,61 @@ impl App {
                 planet_render_info.push(PlanetRenderInfo {
                     planet_up: planet_up_f32, camera_dist: camera_dist_f32,
                     radius: planet.radius as f32, atmosphere_radius: planet.atmosphere_radius as f32,
+                    planet_color: planet.planet_color, parent_star: planet.parent_star,
                     beta_rayleigh: planet.beta_rayleigh, beta_mie: planet.beta_mie,
                     mie_g: planet.mie_g, hr: planet.hr, hm: planet.hm,
                 });
             }
         }
 
-        let count = planet_render_info.len().min(self.data.planets_capacity as usize);
+        let planet_count = planet_render_info.len().min(self.data.planets_capacity as usize);
         memcpy(
             planet_render_info.as_ptr().cast::<u8>(),
             self.data.planets_buffers_mapped[image_index],
-            size_of::<PlanetRenderInfo>() * count,
+            size_of::<PlanetRenderInfo>() * planet_count,
         );
 
+        // Compute star info
+        let mut star_render_info = Vec::with_capacity(self.data.game_data.stars.len());
+        for star in &self.data.game_data.stars {
+            let to_camera = self.camera.position - star.position;
+            let to_camera_length = to_camera.magnitude();
+
+            if to_camera_length <= 0.0 {
+                continue;
+            }
+
+            let camera_dist = to_camera_length - star.radius;
+            let star_up = to_camera / to_camera_length;
+
+            let camera_dist_f32 = camera_dist as f32;
+            let star_up_f32 = Vec3::new(star_up.x as f32, star_up.y as f32, star_up.z as f32);
+
+            if camera_dist_f32.is_finite() {
+                star_render_info.push(StarRenderInfo {
+                    star_up: star_up_f32, camera_dist: camera_dist_f32,
+                    radius: star.radius as f32,
+                    color: star.color,
+                    brightness: star.brightness,
+                });
+            }
+        }
+
+        let star_count = star_render_info.len().min(self.data.stars_capacity as usize);
+        memcpy(
+            star_render_info.as_ptr().cast::<u8>(),
+            self.data.stars_buffers_mapped[image_index],
+            size_of::<StarRenderInfo>() * star_count,
+        );
+
+        // Camera ubo
         let ubo = CameraUniformBufferObject {
             view_inverse: view.invert().ok_or_else(|| anyhow!("Failed to invert view matrix"))?,
             proj_inverse: proj.invert().ok_or_else(|| anyhow!("Failed to invert proj matrix"))?,
             time,
             camera_pos: Vec3::new(self.camera.position.x as f32, self.camera.position.y as f32, self.camera.position.z as f32),
-            num_planets: count as u32,
+            num_planets: planet_count as u32,
+            num_stars: star_count as u32,
         };
 
         memcpy(
@@ -1628,10 +1607,20 @@ impl App {
                 .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                 .buffer_info(std::slice::from_ref(&planets_info)).build());
 
+            let stars_info = vk::DescriptorBufferInfo::builder()
+                .buffer(self.data.stars_buffers[i])
+                .offset(0)
+                .range(vk::WHOLE_SIZE)
+                .build();
+            writes.push(vk::WriteDescriptorSet::builder()
+                .dst_set(self.data.descriptor_sets[i]).dst_binding(8).dst_array_element(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(std::slice::from_ref(&stars_info)).build());
+
             if !texture_infos.is_empty() {
                 writes.push(vk::WriteDescriptorSet::builder()
                     .dst_set(self.data.descriptor_sets[i])
-                    .dst_binding(8)
+                    .dst_binding(9)
                     .dst_array_element(0)
                     .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                     .image_info(&texture_infos)
@@ -1848,6 +1837,12 @@ struct AppData {
     planets_buffers_mapped: Vec<*mut u8>,
     planets_capacity: u32,
 
+    // Stars
+    stars_buffers: Vec<vk::Buffer>,
+    stars_buffers_memory: Vec<vk::DeviceMemory>,
+    stars_buffers_mapped: Vec<*mut u8>,
+    stars_capacity: u32,
+
     // Misc structs
     game_data: GameData,
     render_info: RenderInfo,
@@ -1857,6 +1852,7 @@ struct AppData {
 #[derive(Default)]
 struct GameData {
     planets: Vec<Planet>,
+    stars: Vec<Star>
 }
 
 
@@ -1864,45 +1860,7 @@ struct GameData {
 #[derive(Default)]
 struct RenderInfo {
     planet_render_info: Vec<PlanetRenderInfo>,
-}
-
-
-#[derive(smart_default::SmartDefault)]
-struct Planet {
-    #[default(Vec3d::new(0.0, 0.0, 0.0))]
-    position: Vec3d,
-    #[default(1000.0)]
-    radius: f64,
-    #[default(0.0)]
-    atmosphere_radius: f64,
-
-    #[default(Vec3::new(5.8e-6, 13.5e-6, 33.1e-6))]
-    beta_rayleigh: Vec3,
-    #[default(21e-6)]
-    beta_mie: f32,
-    #[default(0.76)]
-    mie_g: f32,
-    #[default(8500.0)]
-    hr: f32,
-    #[default(1200.0)]
-    hm: f32,
-}
-
-#[repr(C)]
-#[derive(smart_default::SmartDefault, Copy, Clone, Debug)]
-struct PlanetRenderInfo {
-    #[default(Vec3::new(0.0, 0.0, 0.0))]
-    planet_up: Vec3,
-    camera_dist: f32,
-    radius: f32,
-    atmosphere_radius: f32,
-
-    #[default(Vec3::new(0.0, 0.0, 0.0))]
-    beta_rayleigh: Vec3,
-    beta_mie: f32,
-    mie_g: f32,
-    hr: f32,
-    hm: f32,
+    star_render_info: Vec<StarRenderInfo>,
 }
 
 
@@ -2011,7 +1969,9 @@ struct CameraUniformBufferObject {
     proj_inverse: Mat4,
     time: f32,
     camera_pos: Vec3,
+
     num_planets: u32,
+    num_stars: u32,
 }
 
 
@@ -2414,7 +2374,8 @@ unsafe fn create_logical_device(
 
     let base_features = vk::PhysicalDeviceFeatures::builder()
         .shader_int64(true)
-        .shader_int16(true);
+        .shader_int16(true)
+        .shader_float64(true);
     
     let mut features2 = vk::PhysicalDeviceFeatures2::builder()
         .features(base_features)
@@ -3202,6 +3163,29 @@ unsafe fn create_planets_buffers(instance: &Instance, device: &Device, data: &mu
         data.planets_buffers_mapped.push(mapped);
     }
     data.planets_capacity = MAX_PLANETS;
+    Ok(())
+}}
+
+unsafe fn create_stars_buffers(instance: &Instance, device: &Device, data: &mut AppData) -> Result<()> { unsafe {
+    data.stars_buffers.clear();
+    data.stars_buffers_memory.clear();
+    data.stars_buffers_mapped.clear();
+
+    let size = (size_of::<StarRenderInfo>() as u64) * MAX_STARS as u64;
+
+    for _ in 0..data.swapchain_images.len() {
+        let (buf, mem) = create_buffer(
+            instance, device, data, size,
+            vk::BufferUsageFlags::STORAGE_BUFFER,
+            vk::MemoryPropertyFlags::HOST_COHERENT | vk::MemoryPropertyFlags::HOST_VISIBLE,
+        )?;
+        let mapped = device.map_memory(mem, 0, size, vk::MemoryMapFlags::empty())? as *mut u8;
+
+        data.stars_buffers.push(buf);
+        data.stars_buffers_memory.push(mem);
+        data.stars_buffers_mapped.push(mapped);
+    }
+    data.stars_capacity = MAX_STARS;
     Ok(())
 }}
 
@@ -3995,9 +3979,15 @@ unsafe fn create_descriptor_set_layout(
         .descriptor_count(1)
         .stage_flags(rt_stages);
 
+    let stars_binding = vk::DescriptorSetLayoutBinding::builder()
+        .binding(8)
+        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+        .descriptor_count(1)
+        .stage_flags(rt_stages);
+
     // MUST ALWAYS BE HIGHEST
     let textures_binding = vk::DescriptorSetLayoutBinding::builder()
-        .binding(8)
+        .binding(9)
         .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
         .descriptor_count(MAX_TEXTURES)
         .stage_flags(rt_stages);
@@ -4009,10 +3999,12 @@ unsafe fn create_descriptor_set_layout(
         object_descs_binding, materials_binding, material_ids_binding,
         accum_image_binding,
         planets_binding,
+        stars_binding,
         textures_binding,
     ];
 
     let binding_flags = &[
+        vk::DescriptorBindingFlags::empty(),
         vk::DescriptorBindingFlags::empty(),
         vk::DescriptorBindingFlags::empty(),
         vk::DescriptorBindingFlags::empty(),
@@ -4242,11 +4234,25 @@ unsafe fn create_descriptor_sets(device: &Device, data: &mut AppData) -> Result<
             .buffer_info(std::slice::from_ref(&planets_info)).build());
 
 
+        // Star write
+        let stars_info = vk::DescriptorBufferInfo::builder()
+            .buffer(data.stars_buffers[i])
+            .offset(0)
+            .range(vk::WHOLE_SIZE)
+            .build();
+        writes.push(vk::WriteDescriptorSet::builder()
+            .dst_set(data.descriptor_sets[i])
+            .dst_binding(8)
+            .dst_array_element(0)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(std::slice::from_ref(&stars_info)).build());
+
+
         // Texture write
         if !texture_infos.is_empty() {
             let textures_write = vk::WriteDescriptorSet::builder()
                 .dst_set(data.descriptor_sets[i])
-                .dst_binding(8)
+                .dst_binding(9)
                 .dst_array_element(0)
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                 .image_info(&texture_infos)
@@ -4329,7 +4335,7 @@ fn main() -> Result<()> {
                         let dt = (Instant::now() - app.last_frame).as_secs_f32();
 
                         app.update_camera(dt);
-                        render_tick(&mut app, dt);
+                        game::render_tick(&mut app, dt);
 
                         if let Err(e) = app.render(&window) {
                             error!("Render failed: {:?}", e);

@@ -8,6 +8,7 @@
 #extension GL_EXT_nonuniform_qualifier : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
 #extension GL_EXT_shader_16bit_storage : require
+#extension GL_ARB_gpu_shader_fp64 : require
 
 
 #define PI 3.14159265359
@@ -90,17 +91,30 @@ struct Material {
     float alphaCutoff;
 };
 
+
 struct PlanetRenderInfo {
     vec3 planetUp;
     float cameraDist;
     float radius;
     float atmosphereRadius;
 
+    vec3 planetColor;
+    int parentStar;
+
     vec3 betaRayleigh;
     float betaMie;
     float mieG;
     float hr;
     float hm;
+};
+
+struct StarRenderInfo {
+    vec3 starUp;
+    float cameraDist;
+    float radius;
+
+    vec3 color;
+    float luminosity;
 };
 
 
@@ -115,8 +129,8 @@ bool finiteVec3(in vec3 v) {
 
 vec3 sanitizeColor(in vec3 c) {
     if (!finiteVec3(c))
-        return vec3(0.0);
-    return max(c, vec3(0.0));
+        return vec3(0);
+    return max(c, vec3(0));
 }
 
 
@@ -272,10 +286,19 @@ float opticalDepth(in SphereRayParams p, in float t0, in float rayLength, in flo
     return depth;
 }
 
-vec3 scatterAtmosphere(in vec3 viewDir, in vec3 sunDir, in SphereRayParams groundParams, in float distFromCenter, in PlanetRenderInfo pinfo, in float jitter, in float segStart, in float segEnd, out vec3 transmittance) {
+vec3 scatterAtmosphere(
+    in vec3 viewDir, in vec3 sunDir,
+    in vec3 sunColor, in float sunIntensity,
+    in SphereRayParams groundParams,
+    in float distFromCenter,
+    in PlanetRenderInfo pinfo,
+    in float jitter,
+    in float segStart, in float segEnd,
+    out vec3 transmittance
+ ) {  // This is only formatted like this to clean up the drowdown in VS
     if (segEnd <= segStart) {
-        transmittance = vec3(1.0);
-        return vec3(0.0);
+        transmittance = vec3(1);
+        return vec3(0);
     }
 
     float stepSize = (segEnd - segStart) / float(SKY_VIEW_SAMPLES);
@@ -320,13 +343,15 @@ vec3 scatterAtmosphere(in vec3 viewDir, in vec3 sunDir, in SphereRayParams groun
         }
     }
 
-    vec3 color = sunIntensity * (phaseRayleigh(mu) * pinfo.betaRayleigh * sunRayleighAccum + phaseMie(mu, pinfo.mieG) * pinfo.betaMie * sunMieAccum);
+    vec3 color = sunIntensity * (phaseRayleigh(mu) * pinfo.betaRayleigh * sunRayleighAccum + phaseMie(mu, pinfo.mieG) * pinfo.betaMie * sunMieAccum) * sunColor;
     color = sanitizeColor(color);
 
     transmittance = exp(-(pinfo.betaRayleigh * odR) - (pinfo.betaMie * odM * 1.1));
     return color;
 }
 
+
+// Sky/miss stuff
 vec3 starField(in vec3 rayDir) {
     vec3 cell = floor(rayDir * 750.0);
     float h = hash3(cell);
@@ -343,7 +368,7 @@ vec3 starField(in vec3 rayDir) {
     return starColor * brightness * 2.0;
 }
 
-vec3 getSky(in vec3 rayDir, in vec3 sunDir, in PlanetRenderInfo pinfo, in float jitter) {    
+vec3 getPlanetSky(in vec3 rayDir, in vec3 sunDir, in vec3 sunColor, in float sunIntensity, in PlanetRenderInfo pinfo, in float jitter) {
     float distFromCenter = pinfo.radius + pinfo.cameraDist;
 
     SphereRayParams groundParams = sphereRayParams(rayDir, distFromCenter, pinfo.planetUp, pinfo.radius);
@@ -354,30 +379,46 @@ vec3 getSky(in vec3 rayDir, in vec3 sunDir, in PlanetRenderInfo pinfo, in float 
 
     float segStart = max(atmoHit.x, 0.0);
     float segEnd = atmoHit.y;
-    if (groundHit.x > 0.0) segEnd = min(segEnd, groundHit.x);
+    bool hitGround = groundHit.x > 0.0;
+    if (hitGround) segEnd = min(segEnd, groundHit.x);
 
     vec3 skyColor = vec3(0);
+    vec3 transmittance = vec3(1.0);
     if (segEnd > segStart) {
-        vec3 unusedTransmittance;
-        skyColor = scatterAtmosphere(rayDir, sunDir, groundParams, distFromCenter, pinfo, jitter, segStart, segEnd, unusedTransmittance);
+        skyColor = scatterAtmosphere(rayDir, sunDir, sunColor, sunIntensity, groundParams, distFromCenter, pinfo, jitter, segStart, segEnd, transmittance);
     }
+    
+    if (hitGround) {
+        vec3 hitPos = rayDir * groundHit.x;
+        vec3 planetCenter = -pinfo.planetUp * distFromCenter;
+        vec3 surfaceNormal = normalize(hitPos - planetCenter); 
+        float NdotL = max(dot(surfaceNormal, sunDir), 0.0);
 
-    if (groundHit.x < 0.0) {
+        vec3 groundLight = pinfo.planetColor * sunColor * sunIntensity * NdotL * (1.0 / PI) * 0.1;
+        skyColor += groundLight * transmittance;
+    } else {
         vec3 mappedColor = (skyColor * (2.51 * skyColor + 0.03)) / (skyColor * (2.43 * skyColor + 0.59) + 0.14);
         mappedColor = pow(clamp(mappedColor, 0.0, 1.0), vec3(0.454545455));
 
         float skyBrightness = luminance(mappedColor);
         float starVisibility = clamp(1.0 - skyBrightness * 4.0, 0.0, 1.0);
-        
         skyColor += starField(rayDir) * starVisibility;
-
-        // Temporary until proper setup is added
-        const float cosAngularRadius = cos(sunAngularRadius);
-        float sunDisc = smoothstep(cosAngularRadius - 0.0001, cosAngularRadius, dot(rayDir, sunDir));
-        skyColor += sunIntensity * sunDisc * smoothstep(0.0, 1.0, sunDir.y);
     }
 
+    skyColor = sanitizeColor(skyColor);
     return skyColor;
+}
+
+vec3 starPositionCamRelative(in StarRenderInfo star) {
+    return -star.starUp * (star.cameraDist + star.radius);
+}
+
+void starLightAtPoint(in StarRenderInfo star, in vec3 pos, out vec3 lightDir, out vec3 irradiance) {
+    dvec3 toStar = starPositionCamRelative(star) - pos;
+    double distSq =  max(dot(toStar, toStar), 1e-6);
+    double invDistSq = inversesqrt(distSq);
+    lightDir = vec3(toStar * invDistSq);
+    irradiance = star.color * float(star.luminosity / (4.0 * PI * distSq));
 }
 
 
