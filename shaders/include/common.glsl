@@ -27,14 +27,6 @@ const float sunAngularRadius = 0.01;
 #define SKY_LIGHT_SAMPLES 8
 
 const float sunIntensity  = 15.0;
-const vec3  betaRayleigh = vec3(5.8e-6, 13.5e-6, 33.1e-6);
-const float betaMie = 21e-6;
-const float mieG = 0.76;
-const float hr = 8500.0;
-const float hm = 1200.0;
-
-
-const float maxFogDist = 100.0;
 
 
 const int MAX_BOUNCES = 6;
@@ -103,6 +95,12 @@ struct PlanetRenderInfo {
     float cameraDist;
     float radius;
     float atmosphereRadius;
+
+    vec3 betaRayleigh;
+    float betaMie;
+    float mieG;
+    float hr;
+    float hm;
 };
 
 
@@ -258,9 +256,9 @@ float phaseRayleigh(in float mu) {
     return 0.05968310365 * (1.0 + mu * mu);
 }
 
-float phaseMie(in float mu) {
-    float g  = mieG, g2 = g * g;
-    return 0.11936620731 * ((1.0 - g2) * (1.0 + mu * mu)) / ((2.0 + g2) * pow(abs(1.0 + g2 - 2.0 * g * mu), 1.5));
+float phaseMie(in float mu, in float mieG) {
+    float g2 = mieG * mieG;
+    return 0.11936620731 * ((1.0 - g2) * (1.0 + mu * mu)) / ((2.0 + g2) * pow(abs(1.0 + g2 - 2.0 * mieG * mu), 1.5));
 }
 
 float opticalDepth(in SphereRayParams p, in float t0, in float rayLength, in float scaleHeight, in float R, in int steps) {
@@ -274,13 +272,14 @@ float opticalDepth(in SphereRayParams p, in float t0, in float rayLength, in flo
     return depth;
 }
 
-vec3 scatterAtmosphere(in vec3 viewDir, in vec3 sunDir, in SphereRayParams groundParams, in float distFromCenter, in vec3 up0, in float radius, in float atmoRadius, in float jitter, in vec2 atmoHit, in vec2 groundHit) {
-    float tMin = max(atmoHit.x, 0.0);
-    float tMax = atmoHit.y;
-    if (groundHit.x > 0.0) tMax = min(tMax, groundHit.x);
+vec3 scatterAtmosphere(in vec3 viewDir, in vec3 sunDir, in SphereRayParams groundParams, in float distFromCenter, in PlanetRenderInfo pinfo, in float jitter, in float segStart, in float segEnd, out vec3 transmittance) {
+    if (segEnd <= segStart) {
+        transmittance = vec3(1.0);
+        return vec3(0.0);
+    }
 
-    float stepSize = (tMax - tMin) / float(SKY_VIEW_SAMPLES);
-    float tStart = tMin + jitter * stepSize;
+    float stepSize = (segEnd - segStart) / float(SKY_VIEW_SAMPLES);
+    float tStart = segStart + jitter * stepSize;
 
     vec3 sunRayleighAccum = vec3(0);
     vec3 sunMieAccum = vec3(0);
@@ -290,38 +289,42 @@ vec3 scatterAtmosphere(in vec3 viewDir, in vec3 sunDir, in SphereRayParams groun
 
     for (int i = 0; i < SKY_VIEW_SAMPLES; i++) {
         float t = tStart + (float(i) + 0.5) * stepSize;
-        float h = heightAtT(groundParams, t, radius);
+        float h = heightAtT(groundParams, t, pinfo.radius);
 
-        float densR = exp(-h / hr) * stepSize;
-        float densM = exp(-h / hm) * stepSize;
+        float densR = exp(-h / pinfo.hr) * stepSize;
+        float densM = exp(-h / pinfo.hm) * stepSize;
         odR += densR;
         odM += densM;
 
-        float distFromCenterAtSample = radius + h;
-        vec3 localPos = up0 * distFromCenter + viewDir * t;
+        float distFromCenterAtSample = pinfo.radius + h;
+        vec3 localPos = pinfo.planetUp * distFromCenter + viewDir * t;
         vec3 localUp = localPos / distFromCenterAtSample;
 
-        SphereRayParams sunGroundParams = sphereRayParams(sunDir, distFromCenterAtSample, localUp, radius);
-        SphereRayParams sunAtmoParams   = sphereRayParams(sunDir, distFromCenterAtSample, localUp, atmoRadius);
+        SphereRayParams sunGroundParams = sphereRayParams(sunDir, distFromCenterAtSample, localUp, pinfo.radius);
+        SphereRayParams sunAtmoParams = sphereRayParams(sunDir, distFromCenterAtSample, localUp, pinfo.radius + pinfo.atmosphereRadius);
 
         vec2 planetShadow = solveSphereHits(sunGroundParams);
         bool inShadow = planetShadow.x > 0.01;
 
         if (!inShadow) {
             vec2 sunHit = solveSphereHits(sunAtmoParams);
-            float sunRayLen = sunHit.y;
+            float sunRayLen = max(sunHit.y, 0.0);
 
-            float sunOdR = opticalDepth(sunGroundParams, 0.0, sunRayLen, hr, radius, SKY_LIGHT_SAMPLES);
-            float sunOdM = opticalDepth(sunGroundParams, 0.0, sunRayLen, hm, radius, SKY_LIGHT_SAMPLES);
+            float sunOdR = opticalDepth(sunGroundParams, 0.0, sunRayLen, pinfo.hr, pinfo.radius, SKY_LIGHT_SAMPLES);
+            float sunOdM = opticalDepth(sunGroundParams, 0.0, sunRayLen, pinfo.hm, pinfo.radius, SKY_LIGHT_SAMPLES);
 
-            vec3 sunTransmittance = exp(-(betaRayleigh * (odR + sunOdR)) - (betaMie * (odM + sunOdM) * 1.1));
+            vec3 sunTransmittance = exp(-(pinfo.betaRayleigh * (odR + sunOdR)) - (pinfo.betaMie * (odM + sunOdM) * 1.1));
 
             sunRayleighAccum += densR * sunTransmittance;
             sunMieAccum += densM * sunTransmittance;
         }
     }
 
-    return sunIntensity * (phaseRayleigh(mu) * betaRayleigh * sunRayleighAccum + phaseMie(mu) * betaMie * sunMieAccum);
+    vec3 color = sunIntensity * (phaseRayleigh(mu) * pinfo.betaRayleigh * sunRayleighAccum + phaseMie(mu, pinfo.mieG) * pinfo.betaMie * sunMieAccum);
+    color = sanitizeColor(color);
+
+    transmittance = exp(-(pinfo.betaRayleigh * odR) - (pinfo.betaMie * odM * 1.1));
+    return color;
 }
 
 vec3 starField(in vec3 rayDir) {
@@ -340,18 +343,23 @@ vec3 starField(in vec3 rayDir) {
     return starColor * brightness * 2.0;
 }
 
-vec3 getSky(in vec3 rayDir, in vec3 sunDir, in float h0, in vec3 up0, in float radius, in float atmosphereRadius, in float jitter) {    
-    float distFromCenter = radius + h0;
+vec3 getSky(in vec3 rayDir, in vec3 sunDir, in PlanetRenderInfo pinfo, in float jitter) {    
+    float distFromCenter = pinfo.radius + pinfo.cameraDist;
 
-    SphereRayParams groundParams = sphereRayParams(rayDir, distFromCenter, up0, radius);
-    SphereRayParams atmoParams   = sphereRayParams(rayDir, distFromCenter, up0, radius + atmosphereRadius);
+    SphereRayParams groundParams = sphereRayParams(rayDir, distFromCenter, pinfo.planetUp, pinfo.radius);
+    SphereRayParams atmoParams = sphereRayParams(rayDir, distFromCenter, pinfo.planetUp, pinfo.radius + pinfo.atmosphereRadius);
 
     vec2 atmoHit = solveSphereHits(atmoParams);
     vec2 groundHit = solveSphereHits(groundParams);
 
+    float segStart = max(atmoHit.x, 0.0);
+    float segEnd = atmoHit.y;
+    if (groundHit.x > 0.0) segEnd = min(segEnd, groundHit.x);
+
     vec3 skyColor = vec3(0);
-    if (atmoHit.y > 0.0) {
-        skyColor = scatterAtmosphere(rayDir, sunDir, groundParams, distFromCenter, up0, radius, radius + atmosphereRadius, jitter, atmoHit, groundHit);
+    if (segEnd > segStart) {
+        vec3 unusedTransmittance;
+        skyColor = scatterAtmosphere(rayDir, sunDir, groundParams, distFromCenter, pinfo, jitter, segStart, segEnd, unusedTransmittance);
     }
 
     if (groundHit.x < 0.0) {

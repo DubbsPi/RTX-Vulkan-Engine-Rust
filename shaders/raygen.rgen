@@ -53,22 +53,47 @@ void main() {
     vec3 rayDirection = normalize(cam.viewInverse * vec4(rayDirView, 0)).xyz;
     float tHit;
     float hitDepth;
+    bool hitPrimaryGeometry = false;
+    vec3 primaryTransmittance = vec3(1);
+    vec3 primaryInscatter = vec3(0);
 
     for (int bounce = 0; bounce < MAX_BOUNCES; bounce++) {
         traceRayEXT(
             topLevelAS, gl_RayFlagsNoneEXT, 0xFF,
             0, 0, 0,
-            rayOrigin, 0.001, rayDirection, 10000.0, 0
+            rayOrigin, 0.001, rayDirection, 100000000.0, 0
         );
         
         if (payload.modelIndex < 0) {
             vec3 sky = vec3(0);
             for (uint i = 0; i < cam.numPlanets; i++) {
                 PlanetRenderInfo pinfo = planetBuffer.planets[i];
-                sky += getSky(rayDirection, sunLightDir, pinfo.cameraDist, pinfo.planetUp, pinfo.radius, pinfo.atmosphereRadius, rand(rngState));
+                sky += getSky(rayDirection, sunLightDir, pinfo, rand(rngState));
             }
             accumulatedColor += throughput * sky;
             break;
+        }
+        
+        if (bounce == 0) {
+            hitPrimaryGeometry = true;
+            for (uint i = 0; i < cam.numPlanets; i++) {
+                PlanetRenderInfo pinfo = planetBuffer.planets[i];
+                float distFromCenter = pinfo.radius + pinfo.cameraDist;
+                SphereRayParams groundParams = sphereRayParams(rayDirection, distFromCenter, pinfo.planetUp, pinfo.radius);
+                SphereRayParams atmoParams = sphereRayParams(rayDirection, distFromCenter, pinfo.planetUp, pinfo.radius + pinfo.atmosphereRadius);
+
+                vec2 groundHit = solveSphereHits(groundParams);
+                vec2 atmoHit = solveSphereHits(atmoParams);
+                float segStart = max(atmoHit.x, 0.0);
+                float segEnd = min(atmoHit.y, payload.tHit);
+
+                if (segEnd > segStart) {
+                    vec3 trans;
+                    vec3 insc = scatterAtmosphere(rayDirection, sunLightDir, groundParams, distFromCenter, pinfo, rand(rngState), segStart, segEnd, trans);
+                    primaryInscatter = primaryInscatter * trans + insc;
+                    primaryTransmittance *= trans;
+                }
+            }
         }
 
 
@@ -104,6 +129,8 @@ void main() {
         uint materialId = materialIds[obj.materialId + payload.primitiveId];
         Material mat = mats[materialId];
         vec3 albedo = mat.albedo;
+
+        accumulatedColor += throughput * mat.emission;
  
         float textureLodLevel = log2(max(payload.tHit, 1.0));
  
@@ -117,17 +144,16 @@ void main() {
         vec3 edge1 = p1 - p0;
         vec3 edge2 = p2 - p0;
         vec3 geometricNormal = normalize(vec3(cross(p1 - p0, p2 - p0) * payload.transform));
+        bool frontFace = dot(geometricNormal, rayDirection) < 0.0;
         if (dot(geometricNormal, rayDirection) > 0.0) geometricNormal = -geometricNormal;
 
-        
-        bool frontFace = dot(geometricNormal, rayDirection) < 0.0;
         vec3 N = frontFace ? normal : -normal;
         vec3 V = -rayDirection;
         float NdotV = max(dot(N, V), 1e-4);
 
-        accumulatedColor += throughput * mat.emission;
+        if (hitPrimaryGeometry) accumulatedColor = accumulatedColor * primaryTransmittance + primaryInscatter;
 
-        vec3 F0 = mix(vec3(0.04 * mat.specular * 2.0), albedo, mat.metallic);
+        vec3 F0 = mix(vec3(0.08 * mat.specular), albedo, mat.metallic);
         vec2 xi = vec2(rand(rngState), rand(rngState));
         vec3 newDir, bsdfWeight;
 
@@ -136,7 +162,7 @@ void main() {
         float coatFresnel = mat.clearcoat * fresnelSchlick1(NdotV, coatF0);
 
         float baseAvailable = 1.0 - coatFresnel;
-        float specProb = clamp(mix(fresnelSchlick(NdotV, F0).x, 1.0, mat.metallic), 0.05, 0.95) * baseAvailable;
+        float specProb = clamp(mix(fresnelSchlick(NdotV, F0).x, 1.0, mat.metallic), 0.01, 0.99) * baseAvailable;
         float coatProb = coatFresnel;
         float diffProb = max(0.0, baseAvailable - specProb);
 
@@ -144,7 +170,7 @@ void main() {
         specProb *= invTotal; coatProb *= invTotal; diffProb *= invTotal;
 
         float u = rand(rngState);
-
+        float epsilon = max(1e-4, length(hitPos) * 1e-5);
 
         if (mat.alphaMode == 2 && mat.transmission > 0.0) {
             float eta = frontFace ? (1.0 / mat.ior) : mat.ior;
@@ -156,10 +182,10 @@ void main() {
 
             if (tir || rand(rngState) < fresnel) {
                 newDir = reflect(-V, N);
-                rayOrigin = hitPos + N * 0.001;
+                rayOrigin = hitPos + N * epsilon;
             } else {
                 newDir = normalize(refracted);
-                rayOrigin = hitPos - N * 0.001;
+                rayOrigin = hitPos - N * epsilon;
             }
 
             bsdfWeight = albedo;
@@ -167,7 +193,7 @@ void main() {
             vec3 T, B;
             buildTangentBasis(N, T, B);
             vec3 Ve = normalize(vec3(dot(V, T), dot(V, B), dot(V, N)));
-            vec3 Ne = sampleGGXVNDF(Ve, max(mat.clearcoatRoughness, 0.02), xi);
+            vec3 Ne = sampleGGXVNDF(Ve, max(mat.clearcoatRoughness, 0.0001), xi);
             vec3 H = normalize(Ne.x * T + Ne.y * B + Ne.z * N);
             newDir = reflect(-V, H);
 
@@ -181,13 +207,13 @@ void main() {
                 bsdfWeight = vec3(Fc * (G / max(G1v, 1e-4)));
             }
             bsdfWeight /= coatProb;
-            rayOrigin = hitPos + N * 0.001;
+            rayOrigin = hitPos + N * epsilon;
         }
         else if (u < coatProb + specProb) {
             vec3 T, B;
             buildTangentBasis(N, T, B);
             vec3 Ve = normalize(vec3(dot(V, T), dot(V, B), dot(V, N)));
-            vec3 Ne = sampleGGXVNDF(Ve, max(mat.roughness, 0.02), xi);
+            vec3 Ne = sampleGGXVNDF(Ve, max(mat.roughness, 0.0001), xi);
             vec3 H = normalize(Ne.x * T + Ne.y * B + Ne.z * N);
             newDir = reflect(-V, H);
 
@@ -201,7 +227,7 @@ void main() {
                 bsdfWeight = baseAvailable * F * (G / max(G1v, 1e-4));
             }
             bsdfWeight /= specProb;
-            rayOrigin = hitPos + N * 0.001;
+            rayOrigin = hitPos + N * epsilon;
         }
         else {
             newDir = sampleCosineHemisphere(xi, N);
@@ -211,7 +237,7 @@ void main() {
             
             bsdfWeight = baseAvailable * (diffuseColor * kd + sheenAdd);
             bsdfWeight /= max(diffProb, 1e-4);
-            rayOrigin = hitPos + N * 0.001;
+            rayOrigin = hitPos + N * epsilon;
         }
 
         throughput *= bsdfWeight;
