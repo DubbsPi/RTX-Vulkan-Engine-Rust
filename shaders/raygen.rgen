@@ -30,8 +30,10 @@ layout(push_constant) uniform PushConstants {
 } pc;
 
 
-layout(location = 0) rayPayloadEXT RayPayload payload;
+layout(location = 0) rayPayloadEXT uint dummyPayload;
 layout(location = 1) rayPayloadEXT bool shadowed;
+
+layout(location = 0) hitObjectAttributeEXT vec2 hitAttribs;
 
 
 void main() {
@@ -41,8 +43,8 @@ void main() {
     vec2 jitter = vec2(rand(rngState), rand(rngState)) - 0.5;
     vec2 pixelCenter = vec2(gl_LaunchIDEXT.xy) + vec2(0.5) + jitter;
 
-    vec2 uv = pixelCenter / vec2(gl_LaunchSizeEXT.xy);
-    vec2 ndc = uv * 2.0 - 1.0;
+    vec2 screenUv = pixelCenter / vec2(gl_LaunchSizeEXT.xy);
+    vec2 ndc = screenUv * 2.0 - 1.0;
 
     vec4 target = normalize(cam.projInverse * vec4(ndc.x, ndc.y, 1, 1));
     vec3 rayDirView = normalize(target.xyz / target.w);
@@ -54,20 +56,51 @@ void main() {
     // Always zero to start since all geometry is camera relative
     vec3 rayOrigin = vec3(0);
     vec3 rayDirection = normalize(cam.viewInverse * vec4(rayDirView, 0)).xyz;
-    float tHit;
     float hitDepth;
-    bool hitPrimaryGeometry = false;
-    vec3 primaryTransmittance = vec3(1);
-    vec3 primaryInscatter = vec3(0);
+
+    int heroChannel = -1;
+    bool prevNEE = false;
+    float prevBsdfPdf = 0.0;
+    float prevSelSum = 0.0;
+    bool hadSurface = false;
+    int glassChain = 0;
+    float pNEE = 1.0;
+
 
     for (int bounce = 0; bounce < MAX_BOUNCES; bounce++) {
-        traceRayEXT(
-            topLevelAS, gl_RayFlagsNoneEXT, 0xFF,
+        hitObjectEXT hit;
+        hitObjectTraceRayEXT(
+            hit, topLevelAS, gl_RayFlagsNoneEXT, 0xFF,
             0, 0, 0,
-            rayOrigin, 0.001, rayDirection, 100000000.0, 0
+            rayOrigin, 0.00001, rayDirection, 100000000.0,
+            0
         );
+
+        bool isMiss = hitObjectIsMissEXT(hit);
+
+        int  modelIndex = -1;
+        uint primId = 0u, matId = 0u;
+        bool isDelta = false, doNEE = false;
+        uint hint = 0u;
+
+        if (!isMiss) {
+            modelIndex = hitObjectGetInstanceCustomIndexEXT(hit) + hitObjectGetGeometryIndexEXT(hit);
+            primId = uint(hitObjectGetPrimitiveIndexEXT(hit));
+            matId = materialIds[descs[modelIndex].materialId + primId];
+
+            isDelta = (mats[matId].alphaMode == 2 && mats[matId].transmission > 0.0);
+
+            float lum  = max(throughput.r, max(throughput.g, throughput.b));
+            pNEE = clamp(lum * 2.0, 0.1, 1.0);
+            doNEE = !isDelta && cam.numStars > 0 && rand(rngState) < pNEE && bounce < MAX_NEE_TESTS;
+
+            hint = (1u << 6) | ((matId & 15u) << 2) | (isDelta ? 2u : 0u) | (doNEE ? 1u : 0u);
+        }
+
+        reorderThreadEXT(hit, hint, 4);
+
         
-        if (payload.modelIndex < 0) {
+        if (isMiss) {
             vec3 sky = vec3(0);
             for (uint i = 0; i < cam.numPlanets; i++) {
                 PlanetRenderInfo pinfo = planetBuffer.planets[i];
@@ -82,7 +115,7 @@ void main() {
                 }
 
                 float lightMag = max(irradiance.r, max(irradiance.g, irradiance.b));
-                vec3 lightColorNorm = lightMag > 1e-6 ? irradiance / lightMag : vec3(0);
+                vec3 lightColorNorm = lightMag > 1e-6? irradiance / lightMag : vec3(0);
 
                 sky += getPlanetSky(rayDirection, lightDir, lightColorNorm, lightMag, pinfo, rand(rngState));
             }
@@ -91,106 +124,80 @@ void main() {
             for (uint i = 0; i < cam.numStars; i++) {
                 StarRenderInfo sinfo = starBuffer.stars[i];
                 vec3 starPos = starPositionCamRelative(sinfo);
-                vec2 hit = intersectSphere(rayOrigin, rayDirection, starPos, sinfo.radius);
-                if (hit.x > 0.0 || hit.y > 0.0) {
-                    sky += sinfo.color * min(sinfo.luminosity, 1e18);
+                vec2 sh = intersectSphere(rayOrigin, rayDirection, starPos, sinfo.radius);
+                if (sh.x > 0.0 || sh.y > 0.0) {
+                    vec3 Le = sinfo.color * min(sinfo.luminosity, 3e2);
+                    float misW = 1.0;
+
+                    if (bounce > 0) {
+                        vec3 dirTo, E;
+                        starLightAtPoint(sinfo, rayOrigin, dirTo, E);
+                        float omega = diskSolidAngle(sinfo.radius, sinfo.cameraDist);
+                        Le = E / omega;
+
+                        if (prevNEE) {
+                            float wj = max(E.r, max(E.g, E.b));
+                            float pLight = (wj / prevSelSum) / omega;
+                            misW = balanceHeuristic(prevBsdfPdf, pLight);
+                        }
+                    }
+                    if (glassChain == 1) misW *= (1.0 - GLASS_NEE_BLEND);
+                    sky += Le * misW;
                 }
             }
-
             accumulatedColor += throughput * sky;
             break;
         }
-        
-        if (bounce == 0) {
-            hitPrimaryGeometry = true;
-            for (uint i = 0; i < cam.numPlanets; i++) {
-                PlanetRenderInfo pinfo = planetBuffer.planets[i];
-                float distFromCenter = pinfo.radius + pinfo.cameraDist;
-
-                if (pinfo.parentStar < 0) continue;
-
-                vec3 planetPos = pinfo.planetUp * distFromCenter;
-                StarRenderInfo sinfo = starBuffer.stars[pinfo.parentStar];
-                vec3 lightDir, irradiance;
-                starLightAtPoint(sinfo, planetPos, lightDir, irradiance);
-
-                float lightMag = max(irradiance.r, max(irradiance.g, irradiance.b));
-                if (lightMag < 1e-6) continue;
-                vec3 lightColorNorm = irradiance / lightMag;
-
-                SphereRayParams groundParams = sphereRayParams(rayDirection, distFromCenter, pinfo.planetUp, pinfo.radius);
-                SphereRayParams atmoParams = sphereRayParams(rayDirection, distFromCenter, pinfo.planetUp, pinfo.radius + pinfo.atmosphereRadius);
-
-                vec2 groundHit = solveSphereHits(groundParams);
-                vec2 atmoHit = solveSphereHits(atmoParams);
-                float segStart = max(atmoHit.x, 0.0);
-                float segEnd = min(atmoHit.y, payload.tHit);
-
-                if (segEnd > segStart) {
-                    vec3 trans;
-                    vec3 insc = scatterAtmosphere(rayDirection, lightDir, lightColorNorm, lightMag, groundParams, distFromCenter, pinfo, rand(rngState), segStart, segEnd, trans);
-                    primaryInscatter = primaryInscatter * trans + insc;
-                    primaryTransmittance *= trans;
-                }
-            }
-        }
 
 
-        ObjectDesc obj = descs[payload.modelIndex];
-        Indices indices = Indices(obj.indexAddress);
+        float tHit = hitObjectGetRayTMaxEXT(hit);
+        mat4x3 worldToObject = hitObjectGetWorldToObjectEXT(hit);
+        hitObjectGetAttributesEXT(hit, 0);
+        vec3 bary = vec3(1.0 - hitAttribs.x - hitAttribs.y, hitAttribs.x, hitAttribs.y);
+
+        ObjectDesc obj = descs[modelIndex];
+        Indices  indices  = Indices(obj.indexAddress);
         Vertices vertices = Vertices(obj.vertexAddress);
-
-        uint i0 = indices.i[3 * payload.primitiveId];
-        uint i1 = indices.i[3 * payload.primitiveId + 1];
-        uint i2 = indices.i[3 * payload.primitiveId + 2];
-
-        vec3 bary = vec3(1.0 - payload.attribs.x - payload.attribs.y, payload.attribs.x, payload.attribs.y);
+        uint i0 = indices.i[3 * primId];
+        uint i1 = indices.i[3 * primId + 1];
+        uint i2 = indices.i[3 * primId + 2];
 
         vec3 p0 = vertices.vert[i0].p;
         vec3 p1 = vertices.vert[i1].p;
         vec3 p2 = vertices.vert[i2].p;
+        vec3 viewNormal = vertices.vert[i0].n * bary.x + vertices.vert[i1].n * bary.y + vertices.vert[i2].n * bary.z;
+        vec3 normal = normalize(vec3(viewNormal * worldToObject));
+        vec2 uv = vertices.vert[i0].uv * bary.x + vertices.vert[i1].uv * bary.y + vertices.vert[i2].uv * bary.z;
 
-        vec3 hitPos = rayOrigin + rayDirection * payload.tHit;
-
-        vec3 n0 = vertices.vert[i0].n;
-        vec3 n1 = vertices.vert[i1].n;
-        vec3 n2 = vertices.vert[i2].n;
-        vec3 viewNormal = n0 * bary.x + n1 * bary.y + n2 * bary.z;
-        vec3 normal = normalize(vec3(viewNormal * payload.transform));
-
-        vec2 uv0 = vertices.vert[i0].uv;
-        vec2 uv1 = vertices.vert[i1].uv;
-        vec2 uv2 = vertices.vert[i2].uv;
-        vec2 uv = uv0 * bary.x + uv1 * bary.y + uv2 * bary.z;
+        Material mat = mats[matId];
+        float u = rand(rngState);
 
 
         // Texturing and materials
-        uint materialId = materialIds[obj.materialId + payload.primitiveId];
-        Material mat = mats[materialId];
         vec3 albedo = mat.albedo;
-
         accumulatedColor += throughput * mat.emission;
- 
-        float textureLodLevel = log2(max(payload.tHit, 1.0));
- 
         if (mat.albedoTextureIndex >= 0) {
-            vec4 textureSample = textureLod(textures[nonuniformEXT(mat.albedoTextureIndex)], uv, textureLodLevel);
-            albedo = textureSample.rgb;
+            float textureLodLevel = log2(max(tHit, 1.0));
+            albedo = textureLod(textures[nonuniformEXT(mat.albedoTextureIndex)], uv, textureLodLevel).rgb;
         }
 
 
         // Special normal calculation for geometric offsets
-        vec3 edge1 = p1 - p0;
-        vec3 edge2 = p2 - p0;
-        vec3 geometricNormal = normalize(vec3(cross(p1 - p0, p2 - p0) * payload.transform));
+        vec3 hitPos = rayOrigin + rayDirection * tHit;
+        float epsilon = max(1e-6, length(hitPos) * 1e-7);
+        vec3 geometricNormal = normalize(vec3(cross(p1 - p0, p2 - p0) * worldToObject));
+
         bool frontFace = dot(geometricNormal, rayDirection) < 0.0;
         if (dot(geometricNormal, rayDirection) > 0.0) geometricNormal = -geometricNormal;
+        
+        if (!frontFace) {
+            throughput *= exp(-mat.absorptionColor * tHit);
+        }
 
         vec3 N = frontFace ? normal : -normal;
         vec3 V = -rayDirection;
         float NdotV = max(dot(N, V), 1e-4);
 
-        if (hitPrimaryGeometry) accumulatedColor = accumulatedColor * primaryTransmittance + primaryInscatter;
 
         vec3 F0 = mix(vec3(0.08 * mat.specular), albedo, mat.metallic);
         vec2 xi = vec2(rand(rngState), rand(rngState));
@@ -208,12 +215,120 @@ void main() {
         float invTotal = 1.0 / max(specProb + coatProb + diffProb, 1e-4);
         specProb *= invTotal; coatProb *= invTotal; diffProb *= invTotal;
 
-        float u = rand(rngState);
-        float epsilon = max(1e-4, length(hitPos) * 1e-5);
+
+        bool didNEE = false;
+        float selSum = 0.0;
+        
+        // NEE nearest star
+        if (doNEE) {
+            uint chosen = 0;
+            float chosenW = 0.0;
+            for (uint i = 0; i < cam.numStars; i++) {
+                float w = starSelWeight(starBuffer.stars[i], hitPos);
+                selSum += w;
+                if (rand(rngState) * selSum < w) { chosen = i; chosenW = w; }
+            }
+
+            if (selSum > 1e-6 && chosenW > 0.0) {
+                didNEE = true;
+                float pSel = chosenW / selSum;
+
+                StarRenderInfo s = starBuffer.stars[chosen];
+                vec3 starDir, E;
+                starLightAtPoint(s, hitPos, starDir, E);
+                float omega = diskSolidAngle(s.radius, s.cameraDist);
+                vec3 L = sampleStarDisk(starDir, s.radius, s.cameraDist, rngState);
+
+                float NdotL = dot(N, L);
+                if (NdotL > 0.0 && dot(geometricNormal, L) > 0.0) {
+                    bool  visible  = false;
+                    bool  viaGlass = false;
+                    vec3  glassT   = vec3(1.0);
+                    vec3  sOrigin  = hitPos + geometricNormal * epsilon;
+
+                    for (int hop = 0; hop <= MAX_GLASS_HOPS; hop++) {
+                        hitObjectEXT sh;
+                        hitObjectTraceRayEXT(
+                            sh, topLevelAS, gl_RayFlagsNoneEXT, 0xFF,
+                            0, 0, 1,
+                            sOrigin, 0.00001, L, 100000000.0,
+                            0
+                        );
+
+                        if (hitObjectIsMissEXT(sh)) { visible = true; break; }
+
+                        int  sModel = hitObjectGetInstanceCustomIndexEXT(sh) + hitObjectGetGeometryIndexEXT(sh);
+                        uint sPrim  = uint(hitObjectGetPrimitiveIndexEXT(sh));
+                        uint sMatId = materialIds[descs[sModel].materialId + sPrim];
+                        Material sMat = mats[sMatId];
+
+                        bool sGlass = (sMat.alphaMode == 2 && sMat.transmission > 0.0);
+                        if (!sGlass || hop == MAX_GLASS_HOPS) break;
+
+                        float sT = hitObjectGetRayTMaxEXT(sh);
+                        mat4x3 sW2O = hitObjectGetWorldToObjectEXT(sh);
+                        ObjectDesc sObj = descs[sModel];
+                        Indices  sIdx  = Indices(sObj.indexAddress);
+                        Vertices sVert = Vertices(sObj.vertexAddress);
+                        vec3 q0 = sVert.vert[sIdx.i[3 * sPrim]].p;
+                        vec3 q1 = sVert.vert[sIdx.i[3 * sPrim + 1]].p;
+                        vec3 q2 = sVert.vert[sIdx.i[3 * sPrim + 2]].p;
+                        vec3 gN = normalize(vec3(cross(q1 - q0, q2 - q0) * sW2O));
+
+                        float cosI = abs(dot(gN, L));
+                        if (dot(gN, L) > 0.0) {
+                            glassT *= exp(-sMat.absorptionColor * sT);
+                        }
+                        float iorS = sMat.ior;
+                        vec3 F0g  = vec3(pow((iorS - 1.0) / (iorS + 1.0), 2.0));
+
+                        vec3 sAlbedo = sMat.albedo;
+                        if (sMat.albedoTextureIndex >= 0) {
+                            float textureLodLevel = log2(max(tHit, 1.0));
+                            sAlbedo = textureLod(textures[nonuniformEXT(sMat.albedoTextureIndex)], uv, textureLodLevel).rgb;
+                        }
+                        glassT *= (1.0 - fresnelSchlick(cosI, F0g).x) * sAlbedo;
+
+                        viaGlass = true;
+                        vec3 sHit = sOrigin + L * sT;
+                        sOrigin = sHit + L * max(1e-6, length(sHit) * 1e-7);
+                    }
+
+                    if (visible) {
+                        float pBsdf;
+                        vec3 f = evalBSDF(N, V, L, mat, albedo, F0, baseAvailable, specProb, coatProb, diffProb, pBsdf);
+                        vec3 base = throughput * f * NdotL * (E / pSel);
+
+                        if (viaGlass) {
+                            accumulatedColor += base * glassT * (GLASS_NEE_BLEND / pNEE);
+                        } else {
+                            float w = balanceHeuristic(pSel / omega, pBsdf);
+                            accumulatedColor += base * w;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (!isDelta) {hadSurface = true; glassChain = 0;}
+
 
         if (mat.alphaMode == 2 && mat.transmission > 0.0) {
-            float eta = frontFace ? (1.0 / mat.ior) : mat.ior;
-            vec3 F0d = vec3(pow((mat.ior - 1.0) / (mat.ior + 1.0), 2.0));
+            float iorC = mat.ior;
+
+            if (mat.dispersion > 0.0) {
+                if (heroChannel < 0) {
+                    heroChannel = min(int(rand(rngState) * 3.0), 2);
+                    vec3 mask = vec3(0.0);
+                    mask[heroChannel] = 1.0;
+                    throughput *= 3.0 * mask;
+                }
+                float halfSpread = (mat.ior - 1.0) * 0.025 * mat.dispersion;
+                iorC = mat.ior + halfSpread * float(heroChannel - 1);
+            }
+
+            float eta = frontFace ? (1.0 / iorC) : iorC;
+            vec3 F0d = vec3(pow((iorC - 1.0) / (iorC + 1.0), 2.0));
             float fresnel = fresnelSchlick(NdotV, F0d).x;
 
             vec3 refracted = refract(-V, N, eta);
@@ -226,7 +341,6 @@ void main() {
                 newDir = normalize(refracted);
                 rayOrigin = hitPos - N * epsilon;
             }
-
             bsdfWeight = albedo;
         } else if (u < coatProb) {
             vec3 T, B;
@@ -240,7 +354,7 @@ void main() {
             if (NdotL <= 0.0) {
                 bsdfWeight = vec3(0.0);
             } else {
-                float Fc = fresnelSchlick1(max(dot(V, H), 0.0), coatF0);
+                float Fc = mat.clearcoat * fresnelSchlick1(max(dot(V, H), 0.0), coatF0);
                 float G = geometrySmithGGX(NdotV, NdotL, mat.clearcoatRoughness);
                 float G1v = geometrySmithGGX(NdotV, 1.0, mat.clearcoatRoughness);
                 bsdfWeight = vec3(Fc * (G / max(G1v, 1e-4)));
@@ -282,13 +396,19 @@ void main() {
         throughput *= bsdfWeight;
         rayDirection = newDir;
 
+        prevNEE = didNEE;
+        if (didNEE) {
+            prevSelSum = selSum;
+            evalBSDF(N, V, newDir, mat, albedo, F0, baseAvailable, specProb, coatProb, diffProb, prevBsdfPdf);
+        }
+
         if (bounce > 1) {
-            float p = max(throughput.r, max(throughput.g, throughput.b));
+            float p = clamp(max(throughput.r, max(throughput.g, throughput.b)), 0.05, 1.0);
             if (rand(rngState) > p) break;
             throughput /= p;
         }
 
-        if (bounce == 0) hitDepth = payload.tHit;
+        if (bounce == 0) hitDepth = tHit;
     }
 
 

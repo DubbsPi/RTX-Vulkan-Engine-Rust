@@ -11,14 +11,14 @@ layout(scalar, binding = 0) readonly buffer RestVertices {Vertex rest[];};
 layout(scalar, binding = 1) writeonly buffer SkinnedVertices {Vertex skinned[];};
 layout(scalar, binding = 2) readonly buffer JointMatrices {mat4 joints[];};
 
-layout(push_constant) uniform PushConstants {uint vertexCount;} pc;
+layout(push_constant) uniform PushConstants {uint firstVertex; uint vertexCount;} pc;
 
 
 void main() {
     uint i = gl_GlobalInvocationID.x;
     if (i >= pc.vertexCount) return;
 
-    Vertex v = rest[i];
+    Vertex v = rest[pc.firstVertex + i];
 
     mat4 skinMatrix =
         float(v.jw[0]) * joints[uint(v.ji[0])] +

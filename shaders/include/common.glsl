@@ -8,11 +8,14 @@
 #extension GL_EXT_nonuniform_qualifier : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
 #extension GL_EXT_shader_16bit_storage : require
-#extension GL_ARB_gpu_shader_fp64 : require
+#extension GL_EXT_ray_query : require
+#extension GL_EXT_shader_invocation_reorder : require
 
 
 #define PI 3.14159265359
 #define TAU 6.28318530718
+#define INV_PI 0.3183098861837907
+#define INV_4PI 0.07957747154594767
 
 
 const float denoiseStrength = 1.0;
@@ -20,25 +23,20 @@ const float denoiseStrength = 1.0;
 #define DEPTH_SENSITIVITY 0.5
 
 
-const vec3 sunLightDir = normalize(vec3(-0.4, 1, 0.2));
-const vec3 sunLightColor = vec3(1);
-const float sunAngularRadius = 0.01;
+layout(constant_id = 0) const uint MAX_ACCUMULATION = 2048;
+layout(constant_id = 1) const uint MAX_BOUNCES = 6;
+layout(constant_id = 2) const uint MAX_NEE_TESTS = 2;
 
-#define SKY_VIEW_SAMPLES 16
-#define SKY_LIGHT_SAMPLES 8
+layout(constant_id = 3) const uint SKY_VIEW_SAMPLES = 16;
+layout(constant_id = 4) const uint SKY_LIGHT_SAMPLES = 8;
 
-const float sunIntensity  = 15.0;
-
-
-const int MAX_BOUNCES = 6;
-const int MAX_ACCUMULATION = 2048;
+const uint MAX_GLASS_HOPS = 4;
+const float GLASS_NEE_BLEND = 0.5;
 
 
 struct Vertex {
     vec3 p;
-    float pad0;
     vec3 n;
-    float pad1;
     vec2 uv;
     uint16_t ji[4];
     float jw[4];
@@ -79,6 +77,8 @@ struct Material {
 
     float transmission;
     float ior;
+    vec3 absorptionColor;
+    float dispersion;
 
     float specular;
     float clearcoat;
@@ -177,10 +177,25 @@ vec3 cosineHemisphere(in vec3 normal, inout uint seed) {
     );
 }
 
-float hash3(vec3 p) {
+float hash3(in vec3 p) {
     p = fract(p * 0.1031);
     p += dot(p, p.yzx + 33.33);
     return fract((p.x + p.y) * p.z);
+}
+
+void buildTangentBasis(in vec3 N, out vec3 T, out vec3 B) {
+    vec3 up = abs(N.z) < 0.999 ? vec3(0,0,1) : vec3(1,0,0);
+    T = normalize(cross(up, N));
+    B = cross(N, T);
+}
+
+vec3 sampleCosineHemisphere(in vec2 xi, in vec3 N) {
+    float r = sqrt(xi.x);
+    float phi = 2.0 * PI * xi.y;
+    vec3 local = vec3(r * cos(phi), r * sin(phi), sqrt(max(0.0, 1.0 - xi.x)));
+    vec3 T, B;
+    buildTangentBasis(N, T, B);
+    return normalize(local.x * T + local.y * B + local.z * N);
 }
 
 
@@ -190,7 +205,7 @@ float bayerDither(in vec2 pixelPos) {
     
     int index = x + y * 4;
     
-    float pattern[16] = float[16](
+    const float pattern[16] = float[16](
         0.0 / 16.0, 8.0 / 16.0, 2.0 / 16.0, 10.0 / 16.0,
         12.0 / 16.0, 4.0 / 16.0, 14.0 / 16.0, 6.0 / 16.0,
         3.0 / 16.0, 11.0 / 16.0, 1.0 / 16.0, 9.0 / 16.0,
@@ -220,6 +235,22 @@ vec2 intersectSphere(in vec3 ro, in vec3 rd, in vec3 pos, in float r) {
 
     if (tFar < 0.0001) return vec2(-1);
     return vec2(tNear, tFar);
+}
+
+
+float balanceHeuristic(in float a, in float b) {
+    return a / max(a + b, 1e-30);
+}
+
+float diskSolidAngle(in float r, in float d) {
+    float s = min(r / d, 0.9999);
+    return 2.0 * PI * s * s / (1.0 + sqrt(1.0 - s * s));
+}
+
+float D_GGX(in float NdotH, in float a) {
+    float a2 = a * a;
+    float d = NdotH * NdotH * (a2 - 1.0) + 1.0;
+    return a2 / (PI * d * d);
 }
 
 
@@ -275,7 +306,7 @@ float phaseMie(in float mu, in float mieG) {
     return 0.11936620731 * ((1.0 - g2) * (1.0 + mu * mu)) / ((2.0 + g2) * pow(abs(1.0 + g2 - 2.0 * mieG * mu), 1.5));
 }
 
-float opticalDepth(in SphereRayParams p, in float t0, in float rayLength, in float scaleHeight, in float R, in int steps) {
+float opticalDepth(in SphereRayParams p, in float t0, in float rayLength, in float scaleHeight, in float R, in uint steps) {
     float stepSize = rayLength / float(steps);
     float depth = 0.0;
     for (int i = 0; i < steps; i++) {
@@ -365,7 +396,7 @@ vec3 starField(in vec3 rayDir) {
     float colorSeed = hash3(cell + vec3(17.0, 43.0, 91.0));
     vec3 starColor = mix(vec3(0.8, 0.85, 1.0), vec3(1.0, 0.9, 0.75), colorSeed) * 0.1;
 
-    return starColor * brightness * 2.0;
+    return starColor * brightness;
 }
 
 vec3 getPlanetSky(in vec3 rayDir, in vec3 sunDir, in vec3 sunColor, in float sunIntensity, in PlanetRenderInfo pinfo, in float jitter) {
@@ -414,11 +445,40 @@ vec3 starPositionCamRelative(in StarRenderInfo star) {
 }
 
 void starLightAtPoint(in StarRenderInfo star, in vec3 pos, out vec3 lightDir, out vec3 irradiance) {
-    dvec3 toStar = starPositionCamRelative(star) - pos;
-    double distSq =  max(dot(toStar, toStar), 1e-6);
-    double invDistSq = inversesqrt(distSq);
-    lightDir = vec3(toStar * invDistSq);
-    irradiance = star.color * float(star.luminosity / (4.0 * PI * distSq));
+    vec3 toStar = starPositionCamRelative(star) - pos;
+    float scale = max(max(abs(toStar.x), max(abs(toStar.y), abs(toStar.z))), 1e-6);
+    
+    vec3 scaled = toStar / scale;
+
+    float scaledDist = length(scaled);
+    float dist = scale * scaledDist;
+    float invDist = 1.0 / dist;
+
+    lightDir = toStar * invDist;
+
+    float brightness = star.luminosity * invDist;
+    brightness *= invDist;
+    irradiance = star.color * brightness * INV_4PI;
+}
+
+vec3 sampleStarDisk(in vec3 starDir, float starRadius, float dist, inout uint rngState) {
+    float sinThetaMax = clamp(starRadius / dist, 0.0, 1.0);
+    float cosThetaMax = sqrt(max(1.0 - sinThetaMax * sinThetaMax, 0.0));
+
+    vec2 xi = vec2(rand(rngState), rand(rngState));
+    float cosTheta = mix(1.0, cosThetaMax, xi.x);
+    float sinTheta = sqrt(max(1.0 - cosTheta * cosTheta, 0.0));
+    float phi = 2.0 * PI * xi.y;
+
+    vec3 T, B;
+    buildTangentBasis(starDir, T, B);
+    return normalize(cosTheta * starDir + sinTheta * cos(phi) * T + sinTheta * sin(phi) * B);
+}
+
+float starSelWeight(in StarRenderInfo s, in vec3 p) {
+    vec3 dir, E;
+    starLightAtPoint(s, p, dir, E);
+    return max(E.r, max(E.g, E.b));
 }
 
 
@@ -473,15 +533,15 @@ vec3 energyCompensation(in vec3 F0, in float roughness, in float NdotV) {
 }
 
 
-float fresnelSchlick1(float cosTheta, float F0) {
+float fresnelSchlick1(in float cosTheta, in float F0) {
     return F0 + (1.0 - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
 }
 
-vec3 fresnelSchlick(float cosTheta, vec3 F0) {
+vec3 fresnelSchlick(in float cosTheta, in vec3 F0) {
     return F0 + (1.0 - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
 }
 
-float geometrySmithGGX(float NdotV, float NdotL, float roughness) {
+float geometrySmithGGX(in float NdotV, in float NdotL, in float roughness) {
     float a = roughness * roughness;
     float k = a * a * 0.5;
     float ggxV = NdotV / (NdotV * (1.0 - k) + k);
@@ -489,23 +549,8 @@ float geometrySmithGGX(float NdotV, float NdotL, float roughness) {
     return ggxV * ggxL;
 }
 
-void buildTangentBasis(vec3 N, out vec3 T, out vec3 B) {
-    vec3 up = abs(N.z) < 0.999 ? vec3(0,0,1) : vec3(1,0,0);
-    T = normalize(cross(up, N));
-    B = cross(N, T);
-}
 
-vec3 sampleCosineHemisphere(vec2 xi, vec3 N) {
-    float r = sqrt(xi.x);
-    float phi = 2.0 * PI * xi.y;
-    vec3 local = vec3(r * cos(phi), r * sin(phi), sqrt(max(0.0, 1.0 - xi.x)));
-    vec3 T, B;
-    buildTangentBasis(N, T, B);
-    return normalize(local.x * T + local.y * B + local.z * N);
-}
-
-
-vec3 sampleGGXVNDF(vec3 Ve, float roughness, vec2 xi) {
+vec3 sampleGGXVNDF(in vec3 Ve, in float roughness, in vec2 xi) {
     vec3 Vh = normalize(vec3(roughness * Ve.x, roughness * Ve.y, Ve.z));
     float lensq = Vh.x * Vh.x + Vh.y * Vh.y;
 
@@ -526,6 +571,44 @@ vec3 sampleGGXVNDF(vec3 Ve, float roughness, vec2 xi) {
 
 float G1(in float NdotX, in float k) {
     return NdotX / (NdotX * (1.0 - k) + k);
+}
+
+
+vec3 evalBSDF(
+    in vec3 N, in vec3 V, in vec3 L, in Material mat, in vec3 albedo, in vec3 F0,
+    in float baseAvailable, in float specProb, in float coatProb, in float diffProb,
+    out float pdf
+ ) {
+    pdf = 0.0;
+    float NdotL = dot(N, L);
+    if (NdotL <= 0.0) return vec3(0.0);
+
+    float NdotV = max(dot(N, V), 1e-4);
+    vec3 H = normalize(V + L);
+    float NdotH = max(dot(N, H), 0.0);
+    float VdotH = max(dot(V, H), 0.0);
+
+    vec3 diffuseColor = albedo * (1.0 - mat.metallic);
+    vec3 kd = 1.0 - fresnelSchlick(NdotV, F0);
+    vec3 sheenAdd = mat.sheenColor * mat.sheen * pow(1.0 - NdotV, 5.0);
+    vec3 f = baseAvailable * (diffuseColor * kd + sheenAdd) * INV_PI;
+    pdf += diffProb * NdotL * INV_PI;
+    {
+        float D = D_GGX(NdotH, max(mat.roughness, 0.0001));
+        float G = geometrySmithGGX(NdotV, NdotL, mat.roughness);
+        float G1v = geometrySmithGGX(NdotV, 1.0, mat.roughness);
+        f += baseAvailable * fresnelSchlick(VdotH, F0) * (D * G / (4.0 * NdotV * NdotL));
+        pdf += specProb * G1v * D / (4.0 * NdotV);
+    }
+    {
+        float D = D_GGX(NdotH, max(mat.clearcoatRoughness, 0.0001));
+        float G = geometrySmithGGX(NdotV, NdotL, mat.clearcoatRoughness);
+        float G1v = geometrySmithGGX(NdotV, 1.0, mat.clearcoatRoughness);
+        float Fc = mat.clearcoat * fresnelSchlick1(VdotH, 0.04);
+        f += Fc * (D * G / (4.0 * NdotV * NdotL));
+        pdf += coatProb * G1v * D / (4.0 * NdotV);
+    }
+    return f;
 }
 
 

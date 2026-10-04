@@ -6,6 +6,7 @@ use std::hash::{Hash, Hasher};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::fs::File;
+use std::cmp::min;
 
 use indexmap::IndexSet;
 
@@ -70,13 +71,13 @@ pub enum ModelClass {
 
 
 pub struct Model {
-    vertices: Vec<Vertex>,
-    indices: Vec<u32>,
-    material_ids: Vec<u32>,
-    materials: Vec<Material>,
+    pub vertices: Vec<Vertex>,
+    pub indices: Vec<u32>,
+    pub material_ids: Vec<u32>,
+    pub materials: Vec<Material>,
 
-    skeleton: Option<Skeleton>,
-    animations: Vec<AnimationClip>,
+    pub skeleton: Option<Skeleton>,
+    pub animations: Vec<AnimationClip>,
 }
 
 impl Model {
@@ -258,7 +259,19 @@ impl Scene {
             } else {
                 let id = self.materials.len() as u32;
 
-                self.materials.push(*material);
+                let mat = if model_name == Some("Cubes".to_owned()) {
+                    let mut m = *material;
+                    m.alpha_mode = 2;
+                    m.ior = 1.5;
+                    m.transmission = 1.0;
+                    m.dispersion = 6.5;
+                    m.absorption_color = vec3(0.1, 1.0, 1.0);
+                    m
+                } else {
+                    *material
+                };
+                
+                self.materials.push(mat);
                 self.material_map.insert(*material, id);
 
                 id
@@ -277,7 +290,14 @@ impl Scene {
         );
 
         let mut geom_ranges: Vec<GeomRange> = Vec::new();
-        for t in 0..model.indices.len() / 3 {
+
+        if model.indices.len() / 3 > model.material_ids.len() {
+            match &model_name {
+                Some(mn) => error!("Not enough material ids for model {}, some tris will not render!", mn),
+                None => error!("Not enough material ids for model {}, some tris will not render!", self.model_info.len())
+            }
+        }
+        for t in 0..min(model.indices.len() / 3, model.material_ids.len()) {
             let opaque = model.materials
                 .get(model.material_ids[t] as usize)
                 .map_or(true, |m| m.alpha_mode == 0);
@@ -537,6 +557,29 @@ fn convert_materials(document: &Document) -> Vec<Material> {
             // Ior
             let ior = m.ior().unwrap_or(1.5);
 
+            // Absorption color
+            let absorption_color = m
+                .volume()
+                .map(|v| {
+                    let c = v.attenuation_color();
+                    let d = v.attenuation_distance();
+                    if d.is_finite() && d > 0.0 {
+                        let sigma = |x: f32| -x.max(1e-4).ln() / d;
+                        Vec3::new(sigma(c[0]), sigma(c[1]), sigma(c[2]))
+                    } else {
+                        Vec3::new(0.0, 0.0, 0.0)
+                    }
+                })
+                .unwrap_or(Vec3::new(0.0, 0.0, 0.0));
+
+            // Dispersion
+            let dispersion = m
+                .extension_value("KHR_materials_dispersion")
+                .and_then(|v| v.get("dispersion"))
+                .and_then(|d| d.as_f64())
+                .map(|d| d as f32)
+                .unwrap_or(0.0);
+
             // Specular
             let specular = m
                 .specular()
@@ -573,6 +616,8 @@ fn convert_materials(document: &Document) -> Vec<Material> {
                 emission,
                 transmission,
                 ior,
+                absorption_color,
+                dispersion,
                 specular,
                 clearcoat,
                 clearcoat_roughness,
@@ -787,7 +832,7 @@ fn extract_skeleton(document: &Document, buffers: &[gltf::buffer::Data]) -> Opti
     Some(Skeleton {bones, root_bones})
 }
 
-fn dummy_root_skeleton() -> Skeleton {
+pub fn dummy_root_skeleton() -> Skeleton {
     Skeleton {
         bones: vec![Bone {
             node_index: 0,
@@ -894,7 +939,7 @@ impl Hash for Material {
 
 // Model caching
 const CACHE_MAGIC: &[u8; 8] = b"JMCACHE\0";
-const CACHE_VERSION: u32 = 1;
+const CACHE_VERSION: u32 = 3;
 
 #[derive(Clone)]
 pub struct CachedTexture {
@@ -1088,12 +1133,10 @@ fn write_vertex(w: &mut impl Write, v: &Vertex) -> io::Result<()> {
     write_f32(w, v.pos.x)?;
     write_f32(w, v.pos.y)?;
     write_f32(w, v.pos.z)?;
-    write_f32(w, v._pad0)?;
 
     write_f32(w, v.normal.x)?;
     write_f32(w, v.normal.y)?;
     write_f32(w, v.normal.z)?;
-    write_f32(w, v._pad1)?;
 
     write_f32(w, v.uv.x)?;
     write_f32(w, v.uv.y)?;
@@ -1116,15 +1159,11 @@ fn read_vertex(r: &mut impl Read) -> io::Result<Vertex> {
         read_f32(r)?,
     );
 
-    let pad0 = read_f32(r)?;
-
     let normal = Vec3::new(
         read_f32(r)?,
         read_f32(r)?,
         read_f32(r)?,
     );
-
-    let pad1 = read_f32(r)?;
 
     let uv = Vec2::new(
         read_f32(r)?,
@@ -1143,9 +1182,7 @@ fn read_vertex(r: &mut impl Read) -> io::Result<Vertex> {
 
     Ok(Vertex {
         pos,
-        _pad0: pad0,
         normal,
-        _pad1: pad1,
         uv,
         joint_indices,
         joint_weights,
@@ -1168,6 +1205,12 @@ fn write_material(w: &mut impl Write, m: &Material) -> io::Result<()> {
 
     write_f32(w, m.transmission)?;
     write_f32(w, m.ior)?;
+
+    write_f32(w, m.absorption_color.x)?;
+    write_f32(w, m.absorption_color.y)?;
+    write_f32(w, m.absorption_color.z)?;
+    write_f32(w, m.dispersion)?;
+
     write_f32(w, m.specular)?;
     write_f32(w, m.clearcoat)?;
     write_f32(w, m.clearcoat_roughness)?;
@@ -1205,6 +1248,13 @@ fn read_material(r: &mut impl Read) -> io::Result<Material> {
 
         transmission: read_f32(r)?,
         ior: read_f32(r)?,
+
+        absorption_color: Vec3::new(
+            read_f32(r)?,
+            read_f32(r)?,
+            read_f32(r)?,
+        ),
+        dispersion: read_f32(r)?,
 
         specular: read_f32(r)?,
         clearcoat: read_f32(r)?,

@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Result};
 use thiserror::Error;
 use log::*;
+use memoffset::offset_of;
 
 use vulkanalia::loader::{LibloadingLoader, LIBRARY};
 use vulkanalia::window as vk_window;
@@ -48,6 +49,8 @@ use game::PlanetRenderInfo;
 use game::Star;
 use game::StarRenderInfo;
 
+mod terrain_gen;
+
 
 const PORTABILITY_MACOS_VERSION: Version = Version::new(1, 3, 216);
 
@@ -60,18 +63,32 @@ const DEVICE_EXTENSIONS: &[vk::ExtensionName] = &[
     vk::KHR_RAY_TRACING_PIPELINE_EXTENSION.name,
     vk::KHR_DEFERRED_HOST_OPERATIONS_EXTENSION.name,
     vk::KHR_BUFFER_DEVICE_ADDRESS_EXTENSION.name,
+    vk::KHR_RAY_QUERY_EXTENSION.name,
     vk::EXT_DESCRIPTOR_INDEXING_EXTENSION.name,
+    vk::EXT_RAY_TRACING_INVOCATION_REORDER_EXTENSION.name,
 ];
 
 const MAX_FRAMES_IN_FLIGHT: usize = 3;  // Don't touch me!!
 
-const MAX_TEXTURES: u32 = 4096;  // Almost free to increase, but to make dynamic is extreamly hard
+const MAX_TEXTURES: u32 = 1024;  // Almost free to increase, but to make dynamic is extreamly hard
 const MAX_PLANETS: u32 = 8;
 const MAX_STARS: u32 = 4;
 
 const REBUILD_INTERVAL: u32 = 240;
 
 const ENABLE_CUTOUT_SHADER: bool = true;
+const SHADER_SETTINGS_COUNT: usize = 5;
+
+
+macro_rules! spec_entry {
+    ($struct:ty, $field:ident, $id:expr, $ty:ty) => {
+        vk::SpecializationMapEntry {
+            constant_id: $id,
+            offset: offset_of!($struct, $field) as u32,
+            size: std::mem::size_of::<$ty>(),
+        }
+    };
+}
 
 
 #[derive(Copy, Clone, Debug)]
@@ -197,8 +214,7 @@ impl App {
 
 
         // Scene setup
-        let camera = Camera::new(Vec3d::new(0.0, 6371000.0 + 10.0, 0.0));
-        let scene = game::create_scene(&instance, &device, &mut data)?;
+        let (scene, camera) = game::create_scene(&instance, &device, &mut data)?;
 
         data.material_refcounts = vec![0u32; scene.materials.len()];
         for &mat_id in &scene.material_ids {
@@ -208,6 +224,15 @@ impl App {
 
         data.texture_sampler = create_texture_sampler(&device)?;
         info!("Triangles: {}, Vertices: {}", scene.indices.len() / 3, scene.vertices.len());
+
+        data.map_entries = [
+            spec_entry!(ShaderSettings, max_accumulation, 0, u32),
+            spec_entry!(ShaderSettings, max_bounces, 1, u32),
+            spec_entry!(ShaderSettings, max_nee_tests, 2, u32),
+
+            spec_entry!(ShaderSettings, sky_view_samples, 3, u32),
+            spec_entry!(ShaderSettings, sky_light_samples, 4, u32),
+        ];
 
         create_descriptor_set_layout(&device, &mut data)?;
         create_rt_pipeline(&device, &mut data)?;
@@ -304,9 +329,9 @@ impl App {
                     let descriptor_set = device.allocate_descriptor_sets(&alloc_info)?[0];
 
                     let rest_info = vk::DescriptorBufferInfo::builder()
-                        .buffer(vertex_buffer) // your shared merged vertex buffer, local var from earlier in create()
-                        .offset((model_info.model_vertex_range.min as u64) * size_of::<Vertex>() as u64)
-                        .range((vertex_count as u64) * size_of::<Vertex>() as u64)
+                        .buffer(vertex_buffer)
+                        .offset(0)
+                        .range(model_info.model_vertex_range.max as u64 * size_of::<Vertex>() as u64)
                         .build();
                     let skinned_info = vk::DescriptorBufferInfo::builder()
                         .buffer(skinned_buffer).offset(0).range(vk::WHOLE_SIZE).build();
@@ -911,7 +936,7 @@ impl App {
         let wait_stages = &[vk::PipelineStageFlags::TRANSFER];
 
         let command_buffers = &[cmd];
-        let signal_semaphores = &[self.data.render_finished_semaphores[image_index]];
+        let signal_semaphores = &[self.data.render_finished_semaphores[self.frame]];
         let submit_info = vk::SubmitInfo::builder()
             .wait_semaphores(wait_semaphores)
             .wait_dst_stage_mask(wait_stages)
@@ -991,7 +1016,26 @@ impl App {
         Ok(())
     }}
 
+    #[expect(unused)]
+    unsafe fn change_shader_settings(&mut self, new_settings: ShaderSettings) -> Result<()> { unsafe {
+        self.device.device_wait_idle()?;
 
+        info!("Recreating shaders with new settings: {:?}", new_settings);
+        self.data.shader_settings = new_settings;
+
+        self.device.destroy_pipeline(self.data.rt_pipeline, None);
+        self.device.destroy_pipeline_layout(self.data.rt_pipeline_layout, None);
+        destroy_buffer_pair(&self.device, &mut self.data.sbt_buffer, &mut self.data.sbt_buffer_memory);
+
+        create_rt_pipeline(&self.device, &mut self.data)?;
+        create_shader_binding_table(&self.instance, &self.device, &mut self.data)?;
+
+        self.data.accumulated_samples = 0;
+
+        Ok(())
+    }}
+
+    
     unsafe fn update_uniform_buffer(&mut self, image_index: usize) -> Result<()> { unsafe {
         let time = self.start.elapsed().as_secs_f32();
         let view = self.camera.view_matrix();
@@ -1268,7 +1312,17 @@ impl App {
 
         self.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.data.skinning_pipeline);
         self.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, self.data.skinning_pipeline_layout, 0, &[descriptor_set], &[]);
-        self.device.cmd_push_constants(cmd, self.data.skinning_pipeline_layout, vk::ShaderStageFlags::COMPUTE, 0, &vertex_count.to_ne_bytes());
+        let push_constants = [self.scene.model_info[model_index].model_vertex_range.min, vertex_count];
+        self.device.cmd_push_constants(
+            cmd,
+            self.data.skinning_pipeline_layout,
+            vk::ShaderStageFlags::COMPUTE,
+            0,
+            std::slice::from_raw_parts(
+                push_constants.as_ptr().cast::<u8>(),
+                size_of::<[u32; 2]>(),
+            ),
+        );
         self.device.cmd_dispatch(cmd, (vertex_count + 127) / 128, 1, 1);
     }}
 
@@ -1373,12 +1427,11 @@ impl App {
         for i in 0..self.data.skinning_descriptor_sets.len() {
             let Some(descriptor_set) = self.data.skinning_descriptor_sets[i] else { continue; };
             let model_info = &self.scene.model_info[i];
-            let vertex_count = self.data.skinned_vertex_counts[i];
 
             let rest_info = vk::DescriptorBufferInfo::builder()
                 .buffer(self.data.vertex_buffer)
-                .offset((model_info.model_vertex_range.min as u64) * size_of::<Vertex>() as u64)
-                .range((vertex_count as u64) * size_of::<Vertex>() as u64)
+                .offset(0)
+                .range(model_info.model_vertex_range.max as u64 * size_of::<Vertex>() as u64)
                 .build();
 
             let write = vk::WriteDescriptorSet::builder()
@@ -1645,14 +1698,13 @@ impl App {
             let descriptor_set = self.device.allocate_descriptor_sets(&alloc_info)?[0];
 
             let model_info = &self.scene.model_info[i];
-            let vertex_count = self.data.skinned_vertex_counts[i];
             let skinned_buffer = self.data.skinned_vertex_buffers[i].unwrap();
             let joint_buffer = self.data.joint_matrix_buffers[i].unwrap();
 
             let rest_info = vk::DescriptorBufferInfo::builder()
                 .buffer(self.data.vertex_buffer)
-                .offset((model_info.model_vertex_range.min as u64) * size_of::<Vertex>() as u64)
-                .range((vertex_count as u64) * size_of::<Vertex>() as u64)
+                .offset(0)
+                .range(model_info.model_vertex_range.max as u64 * size_of::<Vertex>() as u64)
                 .build();
             let skinned_info = vk::DescriptorBufferInfo::builder()
                 .buffer(skinned_buffer).offset(0).range(vk::WHOLE_SIZE).build();
@@ -1844,8 +1896,9 @@ struct AppData {
     stars_capacity: u32,
 
     // Misc structs
+    shader_settings: ShaderSettings,
+    map_entries: [vk::SpecializationMapEntry; SHADER_SETTINGS_COUNT],
     game_data: GameData,
-    render_info: RenderInfo,
 }
 
 
@@ -1857,10 +1910,14 @@ struct GameData {
 
 
 #[repr(C)]
-#[derive(Default)]
-struct RenderInfo {
-    planet_render_info: Vec<PlanetRenderInfo>,
-    star_render_info: Vec<StarRenderInfo>,
+#[derive(Debug, Default)]
+pub struct ShaderSettings {
+    pub max_accumulation: u32,
+    pub max_bounces: u32,
+    pub max_nee_tests: u32,
+
+    pub sky_view_samples: u32,
+    pub sky_light_samples: u32,
 }
 
 
@@ -1907,7 +1964,9 @@ struct ObjectDesc {
 }
 
 
+#[derive(smart_default::SmartDefault)]
 struct Camera {
+    #[default(Vec3d::new(0.0, 0.0, 0.0))]
     position: Vec3d,
     yaw: f32,
     pitch: f32,
@@ -1916,12 +1975,12 @@ struct Camera {
 }
 
 impl Camera {
-    fn new(position: Vec3d) -> Self {
+    fn new(position: Vec3d, speed: f32) -> Self {
         Self {
-            position: position,
+            position,
             yaw: 90.0_f32.to_radians(),
             pitch: 0.0,
-            speed: 25.0,
+            speed,
             sensitivity: 0.0025,
         }
     }
@@ -2372,10 +2431,14 @@ unsafe fn create_logical_device(
     let mut int16_features = vk::PhysicalDevice16BitStorageFeatures::builder()
         .storage_buffer_16bit_access(true);
 
+    let mut ray_query_features = vk::PhysicalDeviceRayQueryFeaturesKHR::builder()
+        .ray_query(true);
+
+    let mut reordering_features = vk::PhysicalDeviceRayTracingInvocationReorderFeaturesEXT::builder()
+        .ray_tracing_invocation_reorder(true);
+
     let base_features = vk::PhysicalDeviceFeatures::builder()
-        .shader_int64(true)
-        .shader_int16(true)
-        .shader_float64(true);
+        .shader_int16(true);
     
     let mut features2 = vk::PhysicalDeviceFeatures2::builder()
         .features(base_features)
@@ -2385,7 +2448,9 @@ unsafe fn create_logical_device(
         .push_next(&mut dynamic_rendering_features)
         .push_next(&mut scalar_block_layout_features)
         .push_next(&mut descriptor_indexing_features)
-        .push_next(&mut int16_features);
+        .push_next(&mut int16_features)
+        .push_next(&mut ray_query_features)
+        .push_next(&mut reordering_features);
 
     instance.get_physical_device_features2(data.physical_device, &mut features2);
 
@@ -2551,7 +2616,17 @@ unsafe fn prime_skin_all(device: &Device, data: &AppData, scene: &Scene) -> Resu
 
         device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, data.skinning_pipeline);
         device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, data.skinning_pipeline_layout, 0, &[descriptor_set], &[]);
-        device.cmd_push_constants(cmd, data.skinning_pipeline_layout, vk::ShaderStageFlags::COMPUTE, 0, &vertex_count.to_ne_bytes());
+        let push_constants = [scene.model_info[i].model_vertex_range.min, vertex_count];
+        device.cmd_push_constants(
+            cmd,
+            data.skinning_pipeline_layout,
+            vk::ShaderStageFlags::COMPUTE,
+            0,
+            std::slice::from_raw_parts(
+                push_constants.as_ptr().cast::<u8>(),
+                size_of::<[u32; 2]>(),
+            ),
+        );
         device.cmd_dispatch(cmd, (vertex_count + 127) / 128, 1, 1);
     }
 
@@ -2613,9 +2688,9 @@ unsafe fn allocate_skin_resources_for_model(
                 let descriptor_set = device.allocate_descriptor_sets(&alloc_info)?[0];
 
                 let rest_info = vk::DescriptorBufferInfo::builder()
-                    .buffer(vertex_buffer) // your shared merged vertex buffer, local var from earlier in create()
-                    .offset((model_info.model_vertex_range.min as u64) * size_of::<Vertex>() as u64)
-                    .range((vertex_count as u64) * size_of::<Vertex>() as u64)
+                    .buffer(vertex_buffer)
+                    .offset(0)
+                    .range(model_info.model_vertex_range.max as u64 * size_of::<Vertex>() as u64)
                     .build();
                 let skinned_info = vk::DescriptorBufferInfo::builder()
                     .buffer(skinned_buffer).offset(0).range(vk::WHOLE_SIZE).build();
@@ -3296,7 +3371,8 @@ unsafe fn cmd_build_tlas(
     let mut build_info = vk::AccelerationStructureBuildGeometryInfoKHR::builder()
         .type_(vk::AccelerationStructureTypeKHR::TOP_LEVEL)
         .flags(vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE
-             | vk::BuildAccelerationStructureFlagsKHR::ALLOW_UPDATE)
+             | vk::BuildAccelerationStructureFlagsKHR::ALLOW_UPDATE
+             | vk::BuildAccelerationStructureFlagsKHR::ALLOW_COMPACTION)
         .mode(mode)
         .geometries(geometries)
         .dst_acceleration_structure(data.tlas)
@@ -3387,7 +3463,7 @@ unsafe fn build_blas(
 
     let deformable = members.iter().any(|&mi| scene.model_info[mi].model_class == ModelClass::Deformable);
 
-    let mut flags = vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE;
+    let mut flags = vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE | vk::BuildAccelerationStructureFlagsKHR::ALLOW_COMPACTION;
     if deformable {flags |= vk::BuildAccelerationStructureFlagsKHR::ALLOW_UPDATE;}
 
     let build_info = vk::AccelerationStructureBuildGeometryInfoKHR::builder()
@@ -3498,7 +3574,8 @@ unsafe fn create_tlas(
     let size_query = vk::AccelerationStructureBuildGeometryInfoKHR::builder()
         .type_(vk::AccelerationStructureTypeKHR::TOP_LEVEL)
         .flags(vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE
-             | vk::BuildAccelerationStructureFlagsKHR::ALLOW_UPDATE)
+             | vk::BuildAccelerationStructureFlagsKHR::ALLOW_UPDATE
+             | vk::BuildAccelerationStructureFlagsKHR::ALLOW_COMPACTION)
         .mode(vk::BuildAccelerationStructureModeKHR::BUILD)
         .geometries(geometries);
     let mut size_info = vk::AccelerationStructureBuildSizesInfoKHR::default();
@@ -3590,31 +3667,47 @@ unsafe fn create_rt_pipeline(
             None
         };
 
+        // Setup settings
+        let setting_data = std::slice::from_raw_parts(
+            &data.shader_settings as *const _ as *const u8,
+            std::mem::size_of::<ShaderSettings>(),
+        );
+
+        let spec_info = vk::SpecializationInfo::builder()
+            .map_entries(&data.map_entries)
+            .data(setting_data);
+
+
         let raygen_stage = vk::PipelineShaderStageCreateInfo::builder()
             .stage(vk::ShaderStageFlags::RAYGEN_KHR)
             .module(raygen_module)
-            .name(b"main\0");
+            .name(b"main\0")
+            .specialization_info(&spec_info);
 
         let miss_stage = vk::PipelineShaderStageCreateInfo::builder()
             .stage(vk::ShaderStageFlags::MISS_KHR)
             .module(miss_module)
-            .name(b"main\0");
+            .name(b"main\0")
+            .specialization_info(&spec_info);
 
         let shadow_miss_stage = vk::PipelineShaderStageCreateInfo::builder()
             .stage(vk::ShaderStageFlags::MISS_KHR)
             .module(shadow_miss_module)
-            .name(b"main\0");
+            .name(b"main\0")
+            .specialization_info(&spec_info);
 
         let chit_stage = vk::PipelineShaderStageCreateInfo::builder()
             .stage(vk::ShaderStageFlags::CLOSEST_HIT_KHR)
             .module(chit_module)
-            .name(b"main\0");
+            .name(b"main\0")
+            .specialization_info(&spec_info);
 
         let any_hit_stage = rahit_module.map(|module| {
             vk::PipelineShaderStageCreateInfo::builder()
                 .stage(vk::ShaderStageFlags::ANY_HIT_KHR)
                 .module(module)
                 .name(b"main\0")
+                .specialization_info(&spec_info)
                 .build()
         });
 
@@ -3685,7 +3778,7 @@ unsafe fn create_rt_pipeline(
         let pipeline_info = vk::RayTracingPipelineCreateInfoKHR::builder()
             .stages(&stages)
             .groups(groups)
-            .max_pipeline_ray_recursion_depth(2)
+            .max_pipeline_ray_recursion_depth(1)
             .layout(data.rt_pipeline_layout);
 
         let pipelines = device.create_ray_tracing_pipelines_khr(
@@ -3773,7 +3866,7 @@ unsafe fn create_skinning_pipeline(device: &Device, data: &mut AppData) -> Resul
     let push_constant_range = vk::PushConstantRange::builder()
         .stage_flags(vk::ShaderStageFlags::COMPUTE)
         .offset(0)
-        .size(size_of::<u32>() as u32);
+        .size(size_of::<[u32; 2]>() as u32);
 
     let set_layouts = &[data.skinning_descriptor_set_layout];
     let push_constant_ranges = &[push_constant_range];
