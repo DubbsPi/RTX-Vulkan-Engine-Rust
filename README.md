@@ -8,10 +8,12 @@ Currently, it works fairly well, but I definitely have fixes that I need to do f
 </p>
 
 
+
 **To run**
 
 Download either the .exe or linux binary and run it!
 No external deps required anymore!
+
 
 
 **What I'm planning on Adding:**
@@ -20,12 +22,14 @@ No external deps required anymore!
 - Better PBR and metals
 
 
+
 **Why I made this**
 
 I am planning on using this engine for an actual game in the future
 The reasoning behind me making my own engine is that path tracing is generally not common in popular game engines
 Even when similar results are then (for example UE5), there are a ton of issues with performance and lacking needed features
 This way, I could ensure I had everything I could possibly need while also having the greatest lighting possible
+
 
 
 **Features**
@@ -39,6 +43,7 @@ This way, I could ensure I had everything I could possibly need while also havin
 - Near full pbr support
 - High real-time performance
 - Efficient usage of GPU bandwidth
+
 
 
 **Really low quality GIF of the tracing in action**
