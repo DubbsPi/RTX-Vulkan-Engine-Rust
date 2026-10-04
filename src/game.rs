@@ -24,6 +24,12 @@ use crate::common::Mat4;
 use crate::terrain_gen::*;
 
 
+static MAGAZINE_GLB: &[u8] = include_bytes!("../models/Magazine.glb");
+static XENON_GLB: &[u8] = include_bytes!("../models/Xenon.glb");
+static TEST_ROOM_GLB: &[u8] = include_bytes!("../models/Test_Room.glb");
+static TEST_CUBES_GLB: &[u8] = include_bytes!("../models/Test_Cubes.glb");
+
+
 pub unsafe fn create_scene(instance: &Instance, device: &Device, data: &mut AppData) -> Result<(Scene, Camera)> {
     data.shader_settings = ShaderSettings {
         max_accumulation: 4096,
@@ -85,24 +91,24 @@ pub unsafe fn create_scene(instance: &Instance, device: &Device, data: &mut AppD
     
     // Add models
     unsafe {
-        let magazine = Scene::load_model_into_memory(
+        let magazine = Scene::load_model_from_bytes(
             &mut scene,
-            "models/Magazine.glb",
+            MAGAZINE_GLB,
             &instance, &device, data,
         )?;
-        let protogen = Scene::load_model_into_memory(
+        let protogen = Scene::load_model_from_bytes(
             &mut scene,
-            "models/Xenon.glb",
+            XENON_GLB,
             &instance, &device, data,
         )?;
-        let room = Scene::load_model_into_memory(
+        let room = Scene::load_model_from_bytes(
             &mut scene,
-            "models/Test_Room.glb",
+            TEST_ROOM_GLB,
             &instance, &device, data,
         )?;
-        let cubes = Scene::load_model_into_memory(
+        let cubes = Scene::load_model_from_bytes(
             &mut scene,
-            "models/Test_Cubes.glb",
+            TEST_CUBES_GLB,
             &instance, &device, data,
         )?;
 

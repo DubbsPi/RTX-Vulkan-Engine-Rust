@@ -4410,16 +4410,6 @@ fn main() -> Result<()> {
     window.set_cursor_grab(winit::window::CursorGrabMode::Confined)
         .or_else(|_e| window.set_cursor_grab(winit::window::CursorGrabMode::Locked))
         .ok();
-
-
-    let protogen;
-    unsafe {
-        protogen = Some(Scene::load_model_into_memory(
-            &mut app.scene,
-            "models/Protogen.glb",
-            &app.instance, &app.device, &mut app.data,
-        )?);
-    }
     
     
     event_loop.run(move |event, elwt| {
@@ -4499,43 +4489,6 @@ fn main() -> Result<()> {
                     winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::KeyD) => app.input.right = pressed,
                     winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::Space) => app.input.up = pressed,
                     winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::ControlLeft) => app.input.down = pressed,
-
-                    winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::KeyP) => {
-                        if pressed {
-                            app.scene.animations[2].play("Chop_Tree RT");
-                        }
-                    },
-
-                    winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::KeyO) => {
-                        if pressed {
-                            match &protogen {
-                                Some(protogen) => {
-                                    let transform = Mat4::from_translation(vec3(app.camera.position.x as f32, app.camera.position.y as f32, app.camera.position.z as f32)) * Mat4::identity();
-                                    app.queue_add_model(protogen, ModelClass::Rigid, transform, None, Some(1));
-                                },
-                                None => error!("Could not add model to scene"),
-                            }
-                        }
-                    },
-
-                    winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::KeyL) => {
-                        if pressed {
-                            let transform = Mat4::from_translation(vec3(app.camera.position.x as f32, app.camera.position.y as f32, app.camera.position.z as f32)) * Mat4::identity();
-                            let last = app.scene.model_info.len() - 1;
-                            app.scene.set_instance_transform(StringOrInt::Int(last), transform);
-                        }
-                    },
-
-                    winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::KeyI) => {
-                        if pressed {
-                            app.queue_remove_model(StringOrInt::Int(app.scene.model_info.len() - 1));
-                        }
-                    },
-                    winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::KeyK) => {
-                        if pressed {
-                            app.queue_remove_model(StringOrInt::Str("Xenon".to_owned()));
-                        }
-                    },
 
                     winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::Escape) => {
                         if pressed {

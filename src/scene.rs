@@ -3,21 +3,18 @@ use gltf::image::Data;
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::io::{self, Read, Write};
-use std::path::{Path, PathBuf};
-use std::fs::File;
+use std::path::Path;
 use std::cmp::min;
 
 use indexmap::IndexSet;
 
 use cgmath::SquareMatrix;
 use cgmath::vec3;
-use cgmath::Quaternion;
 use cgmath::Matrix;
 use cgmath::InnerSpace;
 
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use log::*;
 
 use vulkanalia::vk::DeviceV1_0;
@@ -29,7 +26,6 @@ use crate::StringOrInt;
 
 use crate::common::Vertex;
 use crate::common::Material;
-use crate::common::Vec2;
 use crate::common::Vec3;
 use crate::common::Mat4;
 use crate::common::Skeleton;
@@ -146,95 +142,26 @@ impl Scene {
         device: &crate::Device,
         data: &mut crate::AppData,
     ) -> Result<Model> { unsafe {
-        use std::path::Path;
-
         let source_path = Path::new(path);
 
-        let asset = if let Some(cache_path) = find_valid_cache(source_path)? {
-            info!("Loading model from cache: {}", cache_path.display());
+        info!("Loading model from cache: {}", source_path.display());
 
-            load_cached_asset(&cache_path)?
-        } else {
-            info!("Cache miss, parsing glTF: {}", path);
+        let asset = build_asset(load_gltf(path)?)?;
 
-            let (
-                vertices,
-                indices,
-                material_ids,
-                materials,
-                images,
-                skeleton,
-                animations,
-            ) = load_gltf(path)?;
+        finish_model_load(asset, path, instance, device, data)
+    }}
 
-            let textures = images
-                .iter()
-                .map(convert_image)
-                .collect::<Result<Vec<_>>>()?;
+    pub unsafe fn load_model_from_bytes(
+        &mut self,
+        bytes: &[u8],
+        instance: &crate::Instance,
+        device: &crate::Device,
+        data: &mut crate::AppData,
+    ) -> Result<Model> { unsafe {
 
-            let asset = CachedAsset {
-                vertices,
-                indices,
-                material_ids,
-                materials,
-                textures,
-                skeleton,
-                animations,
-            };
+        let asset = build_asset(load_gltf_slice(bytes)?)?;
 
-            let cache_path = cache_path_for(source_path);
-            let dependencies = find_gltf_dependencies(source_path)?;
-
-            if let Err(e) = save_cache(&cache_path, &asset, &dependencies) {
-                warn!(
-                    "Failed to save cache {}: {:?}",
-                    cache_path.display(),
-                    e
-                );
-            } else {
-                info!("Saved model cache: {}", cache_path.display());
-            }
-
-            asset
-        };
-
-        let skeleton = asset
-            .skeleton
-            .or_else(|| Some(dummy_root_skeleton()));
-
-        let texture_offset = data.textures.len() as i32;
-
-        let result = create_cached_textures(
-            instance,
-            device,
-            data,
-            &asset.textures,
-        )?;
-
-        data.textures.extend(result);
-
-        let mut materials = asset.materials;
-
-        for material in &mut materials {
-            if material.albedo_texture_index >= 0 {
-                material.albedo_texture_index += texture_offset;
-            }
-        }
-        
-        info!("Loaded {} into memory", path);
-
-        let mut model = Model {
-            vertices: asset.vertices,
-            indices: asset.indices,
-            material_ids: asset.material_ids,
-            materials,
-            skeleton,
-            animations: asset.animations,
-        };
-
-        model.partition_by_opacity();
-
-        Ok(model)
+        finish_model_load(asset, "embedded model", instance, device, data)
     }}
 
     pub fn add_model_to_scene(&mut self, model: &Model, model_class: ModelClass, model_name: Option<String>) {
@@ -396,28 +323,44 @@ impl Scene {
 }
 
 
-fn load_gltf(path: &str) -> Result<(Vec<Vertex>, Vec<u32>, Vec<u32>, Vec<Material>, Vec<Data>, Option<Skeleton>, Vec<AnimationClip>)> {
-    let (document, buffers, images) = gltf::import(path)?;
+type GltfParts = (
+    Vec<Vertex>, Vec<u32>, Vec<u32>, Vec<Material>,
+    Vec<Data>, Option<Skeleton>, Vec<AnimationClip>,
+);
 
-    let mut vertices = Vec::new();
-    let mut indices = Vec::new();
-    let mut material_ids = Vec::new();
+unsafe fn finish_model_load(
+    asset: CachedAsset,
+    label: &str,
+    instance: &crate::Instance,
+    device: &crate::Device,
+    data: &mut crate::AppData,
+) -> Result<Model> { unsafe {
+    let skeleton = asset.skeleton.or_else(|| Some(dummy_root_skeleton()));
 
-    for scene in document.scenes() {
-        for node in scene.nodes() {
-            walk_node(&node, Mat4::identity(), &buffers, &mut vertices, &mut indices, &mut material_ids);
+    let texture_offset = data.textures.len() as i32;
+    let result = create_cached_textures(instance, device, data, &asset.textures)?;
+    data.textures.extend(result);
+
+    let mut materials = asset.materials;
+    for material in &mut materials {
+        if material.albedo_texture_index >= 0 {
+            material.albedo_texture_index += texture_offset;
         }
     }
 
-    let skeleton = extract_skeleton(&document, &buffers);
-    let materials = convert_materials(&document);
-    let animations = match &skeleton {
-        Some(skel) => extract_animations(&document, &buffers, skel),
-        None => Vec::new(),
-    };
+    info!("Loaded {} into memory", label);
 
-    Ok((vertices, indices, material_ids, materials, images, skeleton, animations))
-}
+    let mut model = Model {
+        vertices: asset.vertices,
+        indices: asset.indices,
+        material_ids: asset.material_ids,
+        materials,
+        skeleton,
+        animations: asset.animations,
+    };
+    model.partition_by_opacity();
+    Ok(model)
+}}
 
 fn node_local_matrix(node: &gltf::Node) -> Mat4 {
     let (t, r, s) = node.transform().decomposed();
@@ -907,6 +850,47 @@ fn extract_animations(document: &Document, buffers: &[gltf::buffer::Data], skele
     }).collect()
 }
 
+fn load_gltf(path: &str) -> Result<GltfParts> {
+    let (document, buffers, images) = gltf::import(path)?;
+    process_gltf(document, buffers, images)
+}
+
+fn load_gltf_slice(bytes: &[u8]) -> Result<GltfParts> {
+    let (document, buffers, images) = gltf::import_slice(bytes)?;
+    process_gltf(document, buffers, images)
+}
+
+fn process_gltf(
+    document: Document,
+    buffers: Vec<gltf::buffer::Data>,
+    images: Vec<Data>,
+) -> Result<GltfParts> {
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+    let mut material_ids = Vec::new();
+
+    for scene in document.scenes() {
+        for node in scene.nodes() {
+            walk_node(&node, Mat4::identity(), &buffers, &mut vertices, &mut indices, &mut material_ids);
+        }
+    }
+
+    let skeleton = extract_skeleton(&document, &buffers);
+    let materials = convert_materials(&document);
+    let animations = match &skeleton {
+        Some(skel) => extract_animations(&document, &buffers, skel),
+        None => Vec::new(),
+    };
+
+    Ok((vertices, indices, material_ids, materials, images, skeleton, animations))
+}
+
+fn build_asset(parts: GltfParts) -> Result<CachedAsset> {
+    let (vertices, indices, material_ids, materials, images, skeleton, animations) = parts;
+    let textures = images.iter().map(convert_image).collect::<Result<Vec<_>>>()?;
+    Ok(CachedAsset { vertices, indices, material_ids, materials, textures, skeleton, animations })
+}
+
 
 impl PartialEq for Material {
     fn eq(&self, other: &Self) -> bool {
@@ -937,10 +921,6 @@ impl Hash for Material {
 }
 
 
-// Model caching
-const CACHE_MAGIC: &[u8; 8] = b"JMCACHE\0";
-const CACHE_VERSION: u32 = 3;
-
 #[derive(Clone)]
 pub struct CachedTexture {
     pub width: u32,
@@ -949,6 +929,7 @@ pub struct CachedTexture {
     pub pixels: Vec<u8>,
 }
 
+#[expect(unused)]
 #[derive(Clone, Copy)]
 pub enum TextureFormat {
     R8,
@@ -962,6 +943,7 @@ pub enum TextureFormat {
     R16G16B16A16,
 }
 
+#[expect(unused)]
 impl TextureFormat {
     fn to_u8(self) -> u8 {
         match self {
@@ -999,472 +981,6 @@ pub struct CachedAsset {
     pub textures: Vec<CachedTexture>,
     pub skeleton: Option<Skeleton>,
     pub animations: Vec<AnimationClip>,
-}
-
-#[derive(Clone, Debug)]
-struct CacheDependency {
-    path: PathBuf,
-    size: u64,
-    modified: std::time::SystemTime,
-}
-
-
-fn write_u8(w: &mut impl Write, v: u8) -> io::Result<()> {
-    w.write_all(&[v])
-}
-
-fn write_u16(w: &mut impl Write, v: u16) -> io::Result<()> {
-    w.write_all(&v.to_le_bytes())
-}
-
-fn write_u32(w: &mut impl Write, v: u32) -> io::Result<()> {
-    w.write_all(&v.to_le_bytes())
-}
-
-fn write_u64(w: &mut impl Write, v: u64) -> io::Result<()> {
-    w.write_all(&v.to_le_bytes())
-}
-
-fn write_i32(w: &mut impl Write, v: i32) -> io::Result<()> {
-    w.write_all(&v.to_le_bytes())
-}
-
-fn write_f32(w: &mut impl Write, v: f32) -> io::Result<()> {
-    w.write_all(&v.to_le_bytes())
-}
-
-
-fn read_u8(r: &mut impl Read) -> io::Result<u8> {
-    let mut b = [0u8; 1];
-    r.read_exact(&mut b)?;
-    Ok(b[0])
-}
-
-fn read_u16(r: &mut impl Read) -> io::Result<u16> {
-    let mut b = [0u8; 2];
-    r.read_exact(&mut b)?;
-    Ok(u16::from_le_bytes(b))
-}
-
-fn read_u32(r: &mut impl Read) -> io::Result<u32> {
-    let mut b = [0u8; 4];
-    r.read_exact(&mut b)?;
-    Ok(u32::from_le_bytes(b))
-}
-
-fn read_u64(r: &mut impl Read) -> io::Result<u64> {
-    let mut b = [0u8; 8];
-    r.read_exact(&mut b)?;
-    Ok(u64::from_le_bytes(b))
-}
-
-fn read_i32(r: &mut impl Read) -> io::Result<i32> {
-    let mut b = [0u8; 4];
-    r.read_exact(&mut b)?;
-    Ok(i32::from_le_bytes(b))
-}
-
-fn read_f32(r: &mut impl Read) -> io::Result<f32> {
-    let mut b = [0u8; 4];
-    r.read_exact(&mut b)?;
-    Ok(f32::from_le_bytes(b))
-}
-
-
-fn write_bytes(w: &mut impl Write, data: &[u8]) -> io::Result<()> {
-    write_u64(w, data.len() as u64)?;
-    w.write_all(data)
-}
-
-fn read_bytes(r: &mut impl Read) -> io::Result<Vec<u8>> {
-    let len = read_u64(r)?;
-
-    if len > usize::MAX as u64 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "cached allocation too large",
-        ));
-    }
-
-    let mut data = vec![0u8; len as usize];
-    r.read_exact(&mut data)?;
-    Ok(data)
-}
-
-fn write_string(w: &mut impl Write, s: &str) -> io::Result<()> {
-    write_bytes(w, s.as_bytes())
-}
-
-fn read_string(r: &mut impl Read) -> io::Result<String> {
-    let data = read_bytes(r)?;
-    String::from_utf8(data)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid UTF-8"))
-}
-
-fn write_mat4(w: &mut impl Write, m: &Mat4) -> io::Result<()> {
-    for column in 0..4 {
-        for row in 0..4 {
-            write_f32(w, m[column][row])?;
-        }
-    }
-
-    Ok(())
-}
-
-fn read_mat4(r: &mut impl Read) -> io::Result<Mat4> {
-    let mut m = [[0.0f32; 4]; 4];
-
-    for column in 0..4 {
-        for row in 0..4 {
-            m[column][row] = read_f32(r)?;
-        }
-    }
-
-    Ok(Mat4::new(
-        m[0][0], m[0][1], m[0][2], m[0][3],
-        m[1][0], m[1][1], m[1][2], m[1][3],
-        m[2][0], m[2][1], m[2][2], m[2][3],
-        m[3][0], m[3][1], m[3][2], m[3][3],
-    ))
-}
-
-
-fn write_vertex(w: &mut impl Write, v: &Vertex) -> io::Result<()> {
-    write_f32(w, v.pos.x)?;
-    write_f32(w, v.pos.y)?;
-    write_f32(w, v.pos.z)?;
-
-    write_f32(w, v.normal.x)?;
-    write_f32(w, v.normal.y)?;
-    write_f32(w, v.normal.z)?;
-
-    write_f32(w, v.uv.x)?;
-    write_f32(w, v.uv.y)?;
-
-    for x in v.joint_indices {
-        write_u16(w, x)?;
-    }
-
-    for x in v.joint_weights {
-        write_f32(w, x)?;
-    }
-
-    Ok(())
-}
-
-fn read_vertex(r: &mut impl Read) -> io::Result<Vertex> {
-    let pos = Vec3::new(
-        read_f32(r)?,
-        read_f32(r)?,
-        read_f32(r)?,
-    );
-
-    let normal = Vec3::new(
-        read_f32(r)?,
-        read_f32(r)?,
-        read_f32(r)?,
-    );
-
-    let uv = Vec2::new(
-        read_f32(r)?,
-        read_f32(r)?,
-    );
-
-    let mut joint_indices = [0u16; 4];
-    for x in &mut joint_indices {
-        *x = read_u16(r)?;
-    }
-
-    let mut joint_weights = [0.0f32; 4];
-    for x in &mut joint_weights {
-        *x = read_f32(r)?;
-    }
-
-    Ok(Vertex {
-        pos,
-        normal,
-        uv,
-        joint_indices,
-        joint_weights,
-    })
-}
-
-
-fn write_material(w: &mut impl Write, m: &Material) -> io::Result<()> {
-    write_f32(w, m.albedo.x)?;
-    write_f32(w, m.albedo.y)?;
-    write_f32(w, m.albedo.z)?;
-    write_i32(w, m.albedo_texture_index)?;
-
-    write_f32(w, m.metallic)?;
-    write_f32(w, m.roughness)?;
-
-    write_f32(w, m.emission.x)?;
-    write_f32(w, m.emission.y)?;
-    write_f32(w, m.emission.z)?;
-
-    write_f32(w, m.transmission)?;
-    write_f32(w, m.ior)?;
-
-    write_f32(w, m.absorption_color.x)?;
-    write_f32(w, m.absorption_color.y)?;
-    write_f32(w, m.absorption_color.z)?;
-    write_f32(w, m.dispersion)?;
-
-    write_f32(w, m.specular)?;
-    write_f32(w, m.clearcoat)?;
-    write_f32(w, m.clearcoat_roughness)?;
-
-    write_f32(w, m.sheen)?;
-
-    write_f32(w, m.sheen_color.x)?;
-    write_f32(w, m.sheen_color.y)?;
-    write_f32(w, m.sheen_color.z)?;
-
-    write_u32(w, m.alpha_mode)?;
-    write_f32(w, m.alpha_cutoff)?;
-
-    Ok(())
-}
-
-fn read_material(r: &mut impl Read) -> io::Result<Material> {
-    Ok(Material {
-        albedo: Vec3::new(
-            read_f32(r)?,
-            read_f32(r)?,
-            read_f32(r)?,
-        ),
-
-        albedo_texture_index: read_i32(r)?,
-
-        metallic: read_f32(r)?,
-        roughness: read_f32(r)?,
-
-        emission: Vec3::new(
-            read_f32(r)?,
-            read_f32(r)?,
-            read_f32(r)?,
-        ),
-
-        transmission: read_f32(r)?,
-        ior: read_f32(r)?,
-
-        absorption_color: Vec3::new(
-            read_f32(r)?,
-            read_f32(r)?,
-            read_f32(r)?,
-        ),
-        dispersion: read_f32(r)?,
-
-        specular: read_f32(r)?,
-        clearcoat: read_f32(r)?,
-        clearcoat_roughness: read_f32(r)?,
-
-        sheen: read_f32(r)?,
-
-        sheen_color: Vec3::new(
-            read_f32(r)?,
-            read_f32(r)?,
-            read_f32(r)?,
-        ),
-
-        alpha_mode: read_u32(r)?,
-        alpha_cutoff: read_f32(r)?,
-    })
-}
-
-
-fn write_skeleton(w: &mut impl Write, skeleton: &Skeleton) -> io::Result<()> {
-    write_u64(w, skeleton.bones.len() as u64)?;
-
-    for bone in &skeleton.bones {
-        write_u64(w, bone.node_index as u64)?;
-
-        write_u64(w, bone.children.len() as u64)?;
-        for &child in &bone.children {
-            write_u64(w, child as u64)?;
-        }
-
-        write_mat4(w, &bone.local_transform)?;
-        write_mat4(w, &bone.inverse_bind_matrix)?;
-    }
-
-    write_u64(w, skeleton.root_bones.len() as u64)?;
-    for &root in &skeleton.root_bones {
-        write_u64(w, root as u64)?;
-    }
-
-    Ok(())
-}
-
-fn read_skeleton(r: &mut impl Read) -> io::Result<Skeleton> {
-    let bone_count = read_u64(r)? as usize;
-
-    let mut bones = Vec::with_capacity(bone_count);
-
-    for _ in 0..bone_count {
-        let node_index = read_u64(r)? as usize;
-
-        let child_count = read_u64(r)? as usize;
-        let mut children = Vec::with_capacity(child_count);
-
-        for _ in 0..child_count {
-            children.push(read_u64(r)? as usize);
-        }
-
-        let local_transform = read_mat4(r)?;
-        let inverse_bind_matrix = read_mat4(r)?;
-
-        bones.push(Bone {
-            node_index,
-            children,
-            local_transform,
-            inverse_bind_matrix,
-        });
-    }
-
-    let root_count = read_u64(r)? as usize;
-    let mut root_bones = Vec::with_capacity(root_count);
-
-    for _ in 0..root_count {
-        root_bones.push(read_u64(r)? as usize);
-    }
-
-    Ok(Skeleton {
-        bones,
-        root_bones,
-    })
-}
-
-
-fn write_animation_channel(
-    w: &mut impl Write,
-    channel: &AnimationChannel,
-) -> io::Result<()> {
-    write_u64(w, channel.bone_index as u64)?;
-
-    write_u64(w, channel.translations.len() as u64)?;
-    for &(time, value) in &channel.translations {
-        write_f32(w, time)?;
-        write_f32(w, value.x)?;
-        write_f32(w, value.y)?;
-        write_f32(w, value.z)?;
-    }
-
-    write_u64(w, channel.rotations.len() as u64)?;
-    for &(time, value) in &channel.rotations {
-        write_f32(w, time)?;
-        write_f32(w, value.v.x)?;
-        write_f32(w, value.v.y)?;
-        write_f32(w, value.v.z)?;
-        write_f32(w, value.s)?;
-    }
-
-    write_u64(w, channel.scales.len() as u64)?;
-    for &(time, value) in &channel.scales {
-        write_f32(w, time)?;
-        write_f32(w, value.x)?;
-        write_f32(w, value.y)?;
-        write_f32(w, value.z)?;
-    }
-
-    Ok(())
-}
-
-fn read_animation_channel(
-    r: &mut impl Read,
-) -> io::Result<AnimationChannel> {
-    let bone_index = read_u64(r)? as usize;
-
-    let translation_count = read_u64(r)? as usize;
-    let mut translations = Vec::with_capacity(translation_count);
-
-    for _ in 0..translation_count {
-        let time = read_f32(r)?;
-
-        let value = Vec3::new(
-            read_f32(r)?,
-            read_f32(r)?,
-            read_f32(r)?,
-        );
-
-        translations.push((time, value));
-    }
-
-    let rotation_count = read_u64(r)? as usize;
-    let mut rotations = Vec::with_capacity(rotation_count);
-
-    for _ in 0..rotation_count {
-        let time = read_f32(r)?;
-
-        let x = read_f32(r)?;
-        let y = read_f32(r)?;
-        let z = read_f32(r)?;
-        let w = read_f32(r)?;
-
-        rotations.push((
-            time,
-            Quaternion::new(w, x, y, z),
-        ));
-    }
-
-    let scale_count = read_u64(r)? as usize;
-    let mut scales = Vec::with_capacity(scale_count);
-
-    for _ in 0..scale_count {
-        let time = read_f32(r)?;
-
-        let value = Vec3::new(
-            read_f32(r)?,
-            read_f32(r)?,
-            read_f32(r)?,
-        );
-
-        scales.push((time, value));
-    }
-
-    Ok(AnimationChannel {
-        bone_index,
-        translations,
-        rotations,
-        scales,
-    })
-}
-
-fn write_animation_clip(
-    w: &mut impl Write,
-    clip: &AnimationClip,
-) -> io::Result<()> {
-    write_string(w, &clip.name)?;
-    write_f32(w, clip.duration)?;
-
-    write_u64(w, clip.channels.len() as u64)?;
-
-    for channel in &clip.channels {
-        write_animation_channel(w, channel)?;
-    }
-
-    Ok(())
-}
-
-fn read_animation_clip(
-    r: &mut impl Read,
-) -> io::Result<AnimationClip> {
-    let name = read_string(r)?;
-    let duration = read_f32(r)?;
-
-    let channel_count = read_u64(r)? as usize;
-    let mut channels = Vec::with_capacity(channel_count);
-
-    for _ in 0..channel_count {
-        channels.push(read_animation_channel(r)?);
-    }
-
-    Ok(AnimationClip {
-        name,
-        duration,
-        channels,
-    })
 }
 
 
@@ -1526,36 +1042,6 @@ unsafe fn create_cached_textures(
 
     Ok(result)
 }}
-
-fn write_texture(
-    w: &mut impl Write,
-    texture: &CachedTexture,
-) -> io::Result<()> {
-    write_u32(w, texture.width)?;
-    write_u32(w, texture.height)?;
-    write_u8(w, texture.format.to_u8())?;
-    write_bytes(w, &texture.pixels)?;
-
-    Ok(())
-}
-
-fn read_texture(
-    r: &mut impl Read,
-) -> io::Result<CachedTexture> {
-    let width = read_u32(r)?;
-    let height = read_u32(r)?;
-    let format = TextureFormat::from_u8(read_u8(r)?)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-
-    let pixels = read_bytes(r)?;
-
-    Ok(CachedTexture {
-        width,
-        height,
-        format,
-        pixels,
-    })
-}
 
 fn convert_image(img: &gltf::image::Data) -> Result<CachedTexture> {
     match img.format {
@@ -1652,378 +1138,5 @@ fn convert_image(img: &gltf::image::Data) -> Result<CachedTexture> {
             "Unsupported glTF image format: {:?}",
             other
         )),
-    }
-}
-
-
-fn find_gltf_dependencies(source: &Path) -> Result<Vec<CacheDependency>> {
-    let gltf = gltf::Gltf::open(source)
-        .with_context(|| format!("Opening {}", source.display()))?;
-
-    let base_dir = source.parent().unwrap_or_else(|| Path::new("."));
-
-    let mut paths = vec![source.to_path_buf()];
-
-    // External buffers
-    for buffer in gltf.document.buffers() {
-        if let gltf::buffer::Source::Uri(uri) = buffer.source() {
-           paths.push(normalize_path(base_dir.join(uri)));
-        }
-    }
-
-    // External images
-    for image in gltf.document.images() {
-        if let gltf::image::Source::Uri { uri, .. } = image.source() {
-            paths.push(normalize_path(base_dir.join(uri)));
-        }
-    }
-
-    // Remove duplicates
-    paths.sort();
-    paths.dedup();
-
-    let mut dependencies = Vec::with_capacity(paths.len());
-
-    for path in paths {
-        let (size, modified) = get_file_info(&path)?;
-
-        dependencies.push(CacheDependency {
-            path,
-            size,
-            modified,
-        });
-    }
-
-    Ok(dependencies)
-}
-
-
-fn save_cache(
-    path: &Path,
-    asset: &CachedAsset,
-    dependencies: &[CacheDependency],
-) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("Creating cache directory {}", parent.display()))?;
-    }
-
-    let temp_path = path.with_extension("cache.tmp");
-
-    let mut file = File::create(&temp_path)
-        .with_context(|| format!("Creating temporary cache {}", temp_path.display()))?;
-
-    file.write_all(CACHE_MAGIC)?;
-    write_u32(&mut file, CACHE_VERSION)?;
-
-    write_u64(&mut file, dependencies.len() as u64)?;
-
-    for dependency in dependencies {
-        write_string(
-            &mut file,
-            &dependency.path.to_string_lossy(),
-        )?;
-
-        write_u64(&mut file, dependency.size)?;
-
-        let modified = dependency
-            .modified
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default();
-
-        write_u64(&mut file, modified.as_secs())?;
-        write_u32(&mut file, modified.subsec_nanos())?;
-    }
-
-    file.write_all(CACHE_MAGIC)?;
-    write_u32(&mut file, CACHE_VERSION)?;
-
-    write_u64(&mut file, asset.vertices.len() as u64)?;
-    for vertex in &asset.vertices {
-        write_vertex(&mut file, vertex)?;
-    }
-
-    write_u64(&mut file, asset.indices.len() as u64)?;
-    for &index in &asset.indices {
-        write_u32(&mut file, index)?;
-    }
-
-    write_u64(&mut file, asset.material_ids.len() as u64)?;
-    for &id in &asset.material_ids {
-        write_u32(&mut file, id)?;
-    }
-
-    write_u64(&mut file, asset.materials.len() as u64)?;
-    for material in &asset.materials {
-        write_material(&mut file, material)?;
-    }
-
-    match &asset.skeleton {
-        Some(skeleton) => {
-            write_u8(&mut file, 1)?;
-            write_skeleton(&mut file, skeleton)?;
-        }
-
-        None => {
-            write_u8(&mut file, 0)?;
-        }
-    }
-
-    write_u64(&mut file, asset.animations.len() as u64)?;
-    for animation in &asset.animations {
-        write_animation_clip(&mut file, animation)?;
-    }
-
-    write_u64(&mut file, asset.textures.len() as u64)?;
-    for texture in &asset.textures {
-        write_texture(&mut file, texture)?;
-    }
-
-    file.flush()?;
-    drop(file);
-
-    std::fs::rename(&temp_path, path)
-        .with_context(|| format!("Installing cache {}", path.display()))?;
-
-    Ok(())
-}
-
-pub fn load_cached_asset(path: &std::path::Path) -> Result<CachedAsset> {
-    let mut file = File::open(path)
-        .with_context(|| format!("Opening cache {}", path.display()))?;
-
-    // Magic
-    let mut magic = [0u8; 8];
-    file.read_exact(&mut magic)?;
-
-    if &magic != CACHE_MAGIC {
-        return Err(anyhow!("Invalid cache magic"));
-    }
-
-    // Version
-    let version = read_u32(&mut file)?;
-
-    if version != CACHE_VERSION {
-        return Err(anyhow!(
-            "Unsupported cache version {} (expected {})",
-            version,
-            CACHE_VERSION
-        ));
-    }
-    
-
-    // Dependencies
-    let dependency_count = read_u64(&mut file)? as usize;
-
-    for _ in 0..dependency_count {
-        let _path = read_string(&mut file)?;
-        let _size = read_u64(&mut file)?;
-        let _seconds = read_u64(&mut file)?;
-        let _nanos = read_u32(&mut file)?;
-    }
-
-    // Magic 2
-    let mut data_magic = [0u8; 8];
-    file.read_exact(&mut data_magic)?;
-
-    if &data_magic != CACHE_MAGIC {
-        return Err(anyhow!("Invalid cache data-section magic"));
-    }
-
-    let data_version = read_u32(&mut file)?;
-
-    if data_version != CACHE_VERSION {
-        return Err(anyhow!(
-            "Unsupported cache data section version {} (expected {})",
-            data_version,
-            CACHE_VERSION
-        ));
-    }
-
-    // Vertices
-    let vertex_count = read_u64(&mut file)? as usize;
-    let mut vertices = Vec::with_capacity(vertex_count);
-
-    for _ in 0..vertex_count {
-        vertices.push(read_vertex(&mut file)?);
-    }
-
-    // Indices
-    let index_count = read_u64(&mut file)? as usize;
-    let mut indices = Vec::with_capacity(index_count);
-
-    for _ in 0..index_count {
-        indices.push(read_u32(&mut file)?);
-    }
-
-    // Material Ids
-    let material_id_count = read_u64(&mut file)? as usize;
-    let mut material_ids = Vec::with_capacity(material_id_count);
-
-    for _ in 0..material_id_count {
-        material_ids.push(read_u32(&mut file)?);
-    }
-
-    // Materials
-    let material_count = read_u64(&mut file)? as usize;
-    let mut materials = Vec::with_capacity(material_count);
-
-    for _ in 0..material_count {
-        materials.push(read_material(&mut file)?);
-    }
-
-    // Skeleton
-    let has_skeleton = read_u8(&mut file)?;
-
-    let skeleton = match has_skeleton {
-        0 => None,
-        1 => Some(read_skeleton(&mut file)?),
-        _ => return Err(anyhow!("Invalid skeleton flag {}", has_skeleton)),
-    };
-
-    // Animations
-    let animation_count = read_u64(&mut file)? as usize;
-    let mut animations = Vec::with_capacity(animation_count);
-
-    for _ in 0..animation_count {
-        animations.push(read_animation_clip(&mut file)?);
-    }
-
-    // Textures
-    let texture_count = read_u64(&mut file)? as usize;
-    let mut textures = Vec::with_capacity(texture_count);
-
-    for _ in 0..texture_count {
-        textures.push(read_texture(&mut file)?);
-    }
-
-    Ok(CachedAsset {
-        vertices,
-        indices,
-        material_ids,
-        materials,
-        textures,
-        skeleton,
-        animations,
-    })
-}
-
-fn cache_path_for(source: &Path) -> PathBuf {
-    let parent = source.parent().unwrap_or_else(|| Path::new("."));
-
-    let cache_dir = parent.join("cache");
-
-    let stem = source
-        .file_stem()
-        .unwrap_or_else(|| std::ffi::OsStr::new("asset"));
-
-    cache_dir.join(format!("{}.cache", stem.to_string_lossy()))
-}
-
-fn get_file_info(path: &Path) -> Result<(u64, std::time::SystemTime)> {
-    let metadata = std::fs::metadata(path)
-        .with_context(|| format!("Reading metadata for {}", path.display()))?;
-
-    let modified = metadata
-        .modified()
-        .with_context(|| format!("Reading modification time for {}", path.display()))?;
-
-    Ok((metadata.len(), modified))
-}
-
-pub fn find_valid_cache(source: &Path) -> Result<Option<PathBuf>> {
-    let cache_path = cache_path_for(source);
-
-    let mut file = match File::open(&cache_path) {
-        Ok(file) => file,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(None);
-        }
-        Err(e) => {
-            return Err(e)
-                .with_context(|| format!("Opening cache {}", cache_path.display()));
-        }
-    };
-
-    // Check magic
-    let mut magic = [0u8; 8];
-    file.read_exact(&mut magic)?;
-
-    if &magic != CACHE_MAGIC {
-        warn!(
-            "Invalid cache magic: {}",
-            cache_path.display()
-        );
-
-        return Ok(None);
-    }
-
-    // Check version
-    let version = read_u32(&mut file)?;
-
-    if version != CACHE_VERSION {
-        info!(
-            "Cache version mismatch for {}",
-            source.display()
-        );
-
-        return Ok(None);
-    }
-
-    // Read counts
-    let dependency_count = read_u64(&mut file)? as usize;
-
-    let mut dependencies = Vec::with_capacity(dependency_count);
-
-    for _ in 0..dependency_count {
-        let path = PathBuf::from(read_string(&mut file)?);
-        let size = read_u64(&mut file)?;
-        let seconds = read_u64(&mut file)?;
-        let nanos = read_u32(&mut file)?;
-
-        let modified =
-            std::time::UNIX_EPOCH
-                + std::time::Duration::new(seconds, nanos);
-
-        dependencies.push(CacheDependency {
-            path,
-            size,
-            modified,
-        });
-    }
-
-    // Validate dependencies
-    for dependency in &dependencies {
-        let Ok((size, modified)) =
-            get_file_info(&dependency.path)
-        else {
-            info!(
-                "Cache dependency missing: {}",
-                dependency.path.display()
-            );
-
-            return Ok(None);
-        };
-
-        if size != dependency.size ||
-           modified != dependency.modified
-        {
-            info!(
-                "Cache dependency changed: {}",
-                dependency.path.display()
-            );
-
-            return Ok(None);
-        }
-    }
-
-    Ok(Some(cache_path))
-}
-
-fn normalize_path(path: PathBuf) -> PathBuf {
-    if let Ok(path) = path.canonicalize() {
-        path
-    } else {
-        path
     }
 }
