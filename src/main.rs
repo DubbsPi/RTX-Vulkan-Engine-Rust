@@ -206,6 +206,7 @@ impl App {
         data.timestamp_period = properties.limits.timestamp_period;
 
         create_swapchain(window, &instance, &device, &mut data)?;
+        create_render_finished_semaphores(&device, &mut data)?;
 
         create_command_pool(&instance, &device, &mut data)?;
 
@@ -540,9 +541,6 @@ impl App {
         self.data.in_flight_fences
             .iter()
             .for_each(|f| self.device.destroy_fence(*f, None));
-        self.data.render_finished_semaphores
-            .iter()
-            .for_each(|s| self.device.destroy_semaphore(*s, None));
         self.data.image_available_semaphores
             .iter()
             .for_each(|s| self.device.destroy_semaphore(*s, None));
@@ -575,6 +573,10 @@ impl App {
 
         self.device.destroy_pipeline(self.data.rt_pipeline, None);
         self.device.destroy_pipeline_layout(self.data.rt_pipeline_layout, None);
+
+        for semaphore in self.data.render_finished_semaphores.drain(..) {
+            self.device.destroy_semaphore(semaphore, None);
+        }
 
         destroy_buffer_pair(&self.device, &mut self.data.sbt_buffer, &mut self.data.sbt_buffer_memory);
 
@@ -936,7 +938,7 @@ impl App {
         let wait_stages = &[vk::PipelineStageFlags::TRANSFER];
 
         let command_buffers = &[cmd];
-        let signal_semaphores = &[self.data.render_finished_semaphores[self.frame]];
+        let signal_semaphores = &[self.data.render_finished_semaphores[image_index]];
         let submit_info = vk::SubmitInfo::builder()
             .wait_semaphores(wait_semaphores)
             .wait_dst_stage_mask(wait_stages)
@@ -990,6 +992,7 @@ impl App {
         self.destroy_swapchain();
 
         create_swapchain(window, &self.instance, &self.device, &mut self.data)?;
+        create_render_finished_semaphores(&self.device, &mut self.data)?;
 
         create_storage_image(&self.instance, &self.device, &mut self.data)?;
         create_accum_image(&self.instance, &self.device, &mut self.data)?;
@@ -1069,6 +1072,7 @@ impl App {
             }
         }
 
+        planet_render_info.sort_by(|a, b| a.camera_dist.total_cmp(&b.camera_dist));
         let planet_count = planet_render_info.len().min(self.data.planets_capacity as usize);
         memcpy(
             planet_render_info.as_ptr().cast::<u8>(),
@@ -3129,8 +3133,6 @@ unsafe fn create_sync_objects(device: &Device, data: &mut AppData) -> Result<()>
     for _ in 0..MAX_FRAMES_IN_FLIGHT {
         data.image_available_semaphores
             .push(device.create_semaphore(&semaphore_info, None)?);
-        data.render_finished_semaphores
-            .push(device.create_semaphore(&semaphore_info, None)?);
 
         data.in_flight_fences.push(device.create_fence(&fence_info, None)?);
     }
@@ -3140,6 +3142,14 @@ unsafe fn create_sync_objects(device: &Device, data: &mut AppData) -> Result<()>
         .map(|_| vk::Fence::null())
         .collect();
 
+    Ok(())
+}}
+
+unsafe fn create_render_finished_semaphores(device: &Device, data: &mut AppData) -> Result<()> { unsafe {
+    let semaphore_info = vk::SemaphoreCreateInfo::builder();
+    data.render_finished_semaphores = (0..data.swapchain_images.len())
+        .map(|_| device.create_semaphore(&semaphore_info, None))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(())
 }}
 

@@ -33,6 +33,8 @@ layout(constant_id = 4) const uint SKY_LIGHT_SAMPLES = 8;
 const uint MAX_GLASS_HOPS = 4;
 const float GLASS_NEE_BLEND = 0.5;
 
+const float MAX_STAR_CAMERA_BRIGHTNESS = 1e2;
+
 
 struct Vertex {
     vec3 p;
@@ -317,6 +319,33 @@ float opticalDepth(in SphereRayParams p, in float t0, in float rayLength, in flo
     return depth;
 }
 
+vec3 atmosphereTransmittance(in vec3 rayOrigin, in vec3 rayDir, in PlanetRenderInfo pinfo) {
+    if (pinfo.atmosphereRadius <= 0.0) return vec3(1.0);
+
+    float distFromCenter = pinfo.radius + pinfo.cameraDist;
+    vec3 planetCenterToOrigin = pinfo.planetUp * distFromCenter + rayOrigin;
+    float originDist = length(planetCenterToOrigin);
+    vec3 originUp = planetCenterToOrigin / max(originDist, 1e-6);
+
+    SphereRayParams atmoParams = sphereRayParams(rayDir, originDist, originUp, pinfo.radius + pinfo.atmosphereRadius);
+    vec2 atmoHits = solveSphereHits(atmoParams);
+    if (atmoHits.y <= 0.0) return vec3(1.0);
+
+    float tStart = max(atmoHits.x, 0.0);
+    float tEnd = atmoHits.y;
+    if (tEnd <= tStart) return vec3(1.0);
+
+    SphereRayParams groundParams = sphereRayParams(rayDir, originDist, originUp, pinfo.radius);
+    vec2 groundHits = solveSphereHits(groundParams);
+    if (groundHits.x > tStart && groundHits.x < tEnd) return vec3(0.0);
+
+    float pathLength = tEnd - tStart;
+    uint sampleCount = max(SKY_LIGHT_SAMPLES, 32u);
+    float odR = opticalDepth(groundParams, tStart, pathLength, pinfo.hr, pinfo.radius, sampleCount);
+    float odM = opticalDepth(groundParams, tStart, pathLength, pinfo.hm, pinfo.radius, sampleCount);
+    return exp(-(pinfo.betaRayleigh * odR) - (pinfo.betaMie * odM * 1.1));
+}
+
 vec3 scatterAtmosphere(
     in vec3 viewDir, in vec3 sunDir,
     in vec3 sunColor, in float sunIntensity,
@@ -399,7 +428,7 @@ vec3 starField(in vec3 rayDir) {
     return starColor * brightness;
 }
 
-vec3 getPlanetSky(in vec3 rayDir, in vec3 sunDir, in vec3 sunColor, in float sunIntensity, in PlanetRenderInfo pinfo, in float jitter) {
+vec3 getPlanetSky(in vec3 rayDir, in vec3 sunDir, in vec3 sunColor, in float sunIntensity, in PlanetRenderInfo pinfo, in float jitter, in float maxVisibleDistance, in bool includeGround) {
     float distFromCenter = pinfo.radius + pinfo.cameraDist;
 
     SphereRayParams groundParams = sphereRayParams(rayDir, distFromCenter, pinfo.planetUp, pinfo.radius);
@@ -409,8 +438,8 @@ vec3 getPlanetSky(in vec3 rayDir, in vec3 sunDir, in vec3 sunColor, in float sun
     vec2 groundHit = solveSphereHits(groundParams);
 
     float segStart = max(atmoHit.x, 0.0);
-    float segEnd = atmoHit.y;
-    bool hitGround = groundHit.x > 0.0;
+    float segEnd = min(atmoHit.y, maxVisibleDistance);
+    bool hitGround = includeGround && groundHit.x > 0.0;
     if (hitGround) segEnd = min(segEnd, groundHit.x);
 
     vec3 skyColor = vec3(0);
@@ -427,13 +456,6 @@ vec3 getPlanetSky(in vec3 rayDir, in vec3 sunDir, in vec3 sunColor, in float sun
 
         vec3 groundLight = pinfo.planetColor * sunColor * sunIntensity * NdotL * (1.0 / PI) * 0.1;
         skyColor += groundLight * transmittance;
-    } else {
-        vec3 mappedColor = (skyColor * (2.51 * skyColor + 0.03)) / (skyColor * (2.43 * skyColor + 0.59) + 0.14);
-        mappedColor = pow(clamp(mappedColor, 0.0, 1.0), vec3(0.454545455));
-
-        float skyBrightness = luminance(mappedColor);
-        float starVisibility = clamp(1.0 - skyBrightness * 4.0, 0.0, 1.0);
-        skyColor += starField(rayDir) * starVisibility;
     }
 
     skyColor = sanitizeColor(skyColor);

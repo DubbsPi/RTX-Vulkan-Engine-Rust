@@ -46,8 +46,17 @@ pub unsafe fn create_scene(instance: &Instance, device: &Device, data: &mut AppD
         planet_color: Vec3::new(0.25, 1.0, 0.25),
         ..Default::default()
     });
-    let planet = &data.game_data.planets[0];
+    let planet = &data.game_data.planets[0].clone();
     
+    data.game_data.planets.push( Planet {
+        position: Vec3d::new(6371000.0, 7371000.0, 7371000.0),
+        radius: 2371000.0,
+        atmosphere_radius: 100000.0,
+        parent_star: 0,
+        planet_color: Vec3::new(0.75, 0.25, 0.25),
+        ..Default::default()
+    });
+
     // Generate planet surface
     //let scale = 10000.0;
 
@@ -66,7 +75,7 @@ pub unsafe fn create_scene(instance: &Instance, device: &Device, data: &mut AppD
 
 
     let sun_dist = 149600000000.0;
-    let sun_dir = Vec3d::new(-0.4, 0.0, 0.6).normalize();
+    let sun_dir = Vec3d::new(-0.2, 0.0, 0.6).normalize();
     data.game_data.stars.push(Star {
         position: sun_dir * sun_dist,
         radius: 695700000.0,
@@ -128,11 +137,11 @@ pub unsafe fn create_scene(instance: &Instance, device: &Device, data: &mut AppD
 }
 
 pub fn render_tick(_app: &mut App, _dt: f32) {
-    // Do nothing for now
+    // Do nothing for now...
 }
 
 
-#[derive(smart_default::SmartDefault)]
+#[derive(smart_default::SmartDefault, Clone, Copy)]
 pub struct Planet {
     #[default(Vec3d::new(0.0, 0.0, 0.0))]
     pub position: Vec3d,

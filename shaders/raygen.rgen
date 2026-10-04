@@ -102,12 +102,29 @@ void main() {
         
         if (isMiss) {
             vec3 sky = vec3(0);
+            float nearestPlanetGround = 1e30;
+            int nearestPlanetIndex = -1;
             for (uint i = 0; i < cam.numPlanets; i++) {
                 PlanetRenderInfo pinfo = planetBuffer.planets[i];
 
+                SphereRayParams groundParams = sphereRayParams(
+                    rayDirection, pinfo.radius + pinfo.cameraDist,
+                    pinfo.planetUp, pinfo.radius
+                );
+                vec2 groundHits = solveSphereHits(groundParams);
+                float groundDistance = groundHits.x > 0.0 ? groundHits.x : groundHits.y;
+                if (groundDistance > 0.0 && groundDistance < nearestPlanetGround) {
+                    nearestPlanetGround = groundDistance;
+                    nearestPlanetIndex = int(i);
+                }
+            }
+
+            for (uint i = 0; i < cam.numPlanets; i++) {
+                PlanetRenderInfo pinfo = planetBuffer.planets[i];
                 vec3 planetPos = pinfo.planetUp * (pinfo.radius + pinfo.cameraDist);
                 vec3 lightDir = vec3(0);
                 vec3 irradiance = vec3(0);
+                vec3 lightColorSky = vec3(1);
 
                 if (pinfo.parentStar >= 0) {
                     StarRenderInfo sinfo = starBuffer.stars[pinfo.parentStar];
@@ -117,7 +134,15 @@ void main() {
                 float lightMag = max(irradiance.r, max(irradiance.g, irradiance.b));
                 vec3 lightColorNorm = lightMag > 1e-6? irradiance / lightMag : vec3(0);
 
-                sky += getPlanetSky(rayDirection, lightDir, lightColorNorm, lightMag, pinfo, rand(rngState));
+                sky += getPlanetSky(rayDirection, lightDir, lightColorNorm, lightMag, pinfo, rand(rngState), nearestPlanetGround, int(i) == nearestPlanetIndex);
+            }
+
+            bool hitPlanetGround = nearestPlanetIndex >= 0;
+            if (!hitPlanetGround) {
+                vec3 mappedColor = (sky * (2.51 * sky + 0.03)) / (sky * (2.43 * sky + 0.59) + 0.14);
+                mappedColor = pow(clamp(mappedColor, 0.0, 1.0), vec3(0.454545455));
+                float starVisibility = clamp(1.0 - luminance(mappedColor) * 4.0, 0.0, 1.0);
+                sky += starField(rayDirection) * starVisibility;
             }
             
             // Stars
@@ -125,8 +150,11 @@ void main() {
                 StarRenderInfo sinfo = starBuffer.stars[i];
                 vec3 starPos = starPositionCamRelative(sinfo);
                 vec2 sh = intersectSphere(rayOrigin, rayDirection, starPos, sinfo.radius);
-                if (sh.x > 0.0 || sh.y > 0.0) {
-                    vec3 Le = sinfo.color * min(sinfo.luminosity, 3e2);
+                if (!hitPlanetGround && (sh.x > 0.0 || sh.y > 0.0)) {
+                    vec3 Le = sinfo.color * min(sinfo.luminosity, MAX_STAR_CAMERA_BRIGHTNESS);
+                    for (uint p = 0; p < cam.numPlanets; p++) {
+                        Le *= atmosphereTransmittance(rayOrigin, rayDirection, planetBuffer.planets[p]);
+                    }
                     float misW = 1.0;
 
                     if (bounce > 0) {
@@ -236,6 +264,9 @@ void main() {
                 StarRenderInfo s = starBuffer.stars[chosen];
                 vec3 starDir, E;
                 starLightAtPoint(s, hitPos, starDir, E);
+                for (uint p = 0; p < cam.numPlanets; p++) {
+                    E *= atmosphereTransmittance(hitPos, starDir, planetBuffer.planets[p]);
+                }
                 float omega = diskSolidAngle(s.radius, s.cameraDist);
                 vec3 L = sampleStarDisk(starDir, s.radius, s.cameraDist, rngState);
 
