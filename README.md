@@ -9,12 +9,13 @@ Currently, it works fairly well, but I definitely have fixes that I need to do f
 
 
 **To run**
-Clone the repo with *git clone https://github.com/DubbsPi/RTX-Vulkan-Engine-Rust.git*
-Then enter the base directory
-Finally either use *cargo run* or download the compiled binary and run it from the clone directory
+
+Download either the .exe or linux binary and run it!
+No external deps required anymore!
 
 
 **What I'm planning on Adding:**
+
 - Nvidia's NRD for near perfect denoising
 - Better PBR and metals
 
