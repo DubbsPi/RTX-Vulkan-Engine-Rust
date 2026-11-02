@@ -17,7 +17,7 @@ However, I must note, this project has only been tested on one machine running F
 It runs on a Ryzen 9700X and RTX5070 for certain with Fedora 44 and KDE Plasma 6.8.2 Wayland.
 This requires RTX and dynamic rendering, so a modern card (such as a 40 or 50 series) should work as well.
 Support on other machines cannot be guaranteed.
-
+Either GLIBC_2.43 or GLIBC_2.39 are required to run this application for sure.
 
 
 **What I'm planning on Adding:**
